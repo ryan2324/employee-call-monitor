@@ -45,7 +45,7 @@ Set:
 - `PUBLIC_API_BASE_URL` = your Render API URL ending in `/api/`
 - `COOKIE_SECURE` = `true`
 - `APP_TIMEZONE` = `Asia/Manila`
-- `JOIN_TOKEN_MINUTES` = `10`
+- `JOIN_TOKEN_MINUTES` = `30`
 - `HEARTBEAT_TIMEOUT_SECONDS` = `45`
 - `IDLE_THRESHOLD_SECONDS` = `300`
 - `SESSION_NAME` = `employee_monitor_manager`

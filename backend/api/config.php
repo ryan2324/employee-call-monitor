@@ -42,7 +42,7 @@ return [
         'allowed_origin' => $origin,
         'idle_threshold_seconds' => (int)envv('IDLE_THRESHOLD_SECONDS', '300'),
         'heartbeat_timeout_seconds' => (int)envv('HEARTBEAT_TIMEOUT_SECONDS', '45'),
-        'join_token_minutes' => (int)envv('JOIN_TOKEN_MINUTES', '10'),
+        'join_token_minutes' => (int)envv('JOIN_TOKEN_MINUTES', '30'),
         'api_rate_limit' => (int)envv('API_RATE_LIMIT', '120'),
         'timezone' => $timezone,
         'cookie_secure' => $cookieSecure,

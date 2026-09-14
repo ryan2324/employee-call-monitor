@@ -106,17 +106,27 @@ try {
 
     if($path==='/api/employee/join' && $method==='POST'){
         $b=body();$token=trim((string)($b['token']??''));$name=trim((string)($b['name']??''));$device=trim((string)($b['device_id']??''));$model=trim((string)($b['model']??''));
-        if(!$token||!$name||!$device)out(['joined'=>false,'error'=>'Name, token and device ID are required'],422);
+        if(!$token||!$name||!$device)out(['joined'=>false,'error'=>'Name, token and device ID are required','missing'=>array_values(array_filter(['token'=>$token?'':'token','name'=>$name?'':'name','device_id'=>$device?'':'device_id']))],422);
         $p->beginTransaction();
         try{
-            $q=$p->prepare('SELECT id FROM join_tokens WHERE token=:t AND used_at IS NULL AND expires_at>NOW() FOR UPDATE');$q->execute(['t'=>$token]);$jt=$q->fetch();
-            if(!$jt)throw new RuntimeException('Invalid or expired join code');
+            // expires_at is stored as a UTC timestamp without timezone. Compare it explicitly
+            // against PostgreSQL UTC to avoid session-timezone differences between Render/Neon.
+            $q=$p->prepare('SELECT id, used_at, expires_at FROM join_tokens WHERE token=:t FOR UPDATE');$q->execute(['t'=>$token]);$jt=$q->fetch();
+            if(!$jt)throw new RuntimeException('Join code was not found. Generate a new QR code.');
+            if($jt['used_at']!==null)throw new RuntimeException('This join code has already been used. Generate a new QR code.');
+            $q=$p->prepare("SELECT id FROM join_tokens WHERE id=:id AND expires_at > (NOW() AT TIME ZONE 'UTC')");$q->execute(['id'=>$jt['id']]);
+            if(!$q->fetchColumn())throw new RuntimeException('This join code has expired. Generate a new QR code.');
             $q=$p->prepare('SELECT id,employee_id FROM devices WHERE device_id=:d LIMIT 1');$q->execute(['d'=>$device]);$old=$q->fetch();
             if($old){$eid=(int)$old['employee_id'];$p->prepare('UPDATE employees SET name=:n,active=1 WHERE id=:e')->execute(['n'=>$name,'e'=>$eid]);$p->prepare("UPDATE devices SET model=:model,last_seen=NOW(),call_state='READY',state_changed_at=NOW(),active=1 WHERE id=:id")->execute(['model'=>$model?:null,'id'=>$old['id']]);}
             else{$q=$p->prepare('INSERT INTO employees(name) VALUES(:n) RETURNING id');$q->execute(['n'=>$name]);$eid=(int)$q->fetchColumn();$q=$p->prepare("INSERT INTO devices(employee_id,device_id,model,last_seen,call_state,state_changed_at) VALUES(:e,:d,:m,NOW(),'READY',NOW())");$q->execute(['e'=>$eid,'d'=>$device,'m'=>$model?:null]);}
             $p->prepare('UPDATE join_tokens SET used_at=NOW() WHERE id=:id')->execute(['id'=>$jt['id']]);$p->commit();
             out(['joined'=>true,'employee_id'=>$eid,'device_id'=>$device,'message'=>'Phone connected successfully']);
-        }catch(Throwable $e){if($p->inTransaction())$p->rollBack();out(['joined'=>false,'error'=>$e instanceof RuntimeException?$e->getMessage():'Could not register device'],400);}
+        }catch(Throwable $e){
+            if($p->inTransaction())$p->rollBack();
+            error_log('EMPLOYEE JOIN ERROR: '.get_class($e).' | '.$e->getMessage().' | token_prefix='.substr($token,0,8).' | device='.substr($device,0,32));
+            $msg=$e instanceof RuntimeException?$e->getMessage():'Could not register device. Check the Render log for EMPLOYEE JOIN ERROR.';
+            out(['joined'=>false,'error'=>$msg,'request_id'=>substr(bin2hex(random_bytes(6)),0,12)],400);
+        }
     }
 
     if($path==='/api/employee/status' && $method==='GET'){
