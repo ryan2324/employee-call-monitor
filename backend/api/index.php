@@ -100,7 +100,7 @@ try {
 
     if($path==='/api/join/token' && $method==='POST'){
         manager();$token=bin2hex(random_bytes(16));$exp=time()+(int)$config['app']['join_token_minutes']*60;
-        $q=$p->prepare('INSERT INTO join_tokens(token,expires_at,created_by) VALUES(:t,:exp,:m)');$q->execute(['t'=>$token,'exp'=>date('Y-m-d H:i:s',$exp),'m'=>$_SESSION['manager_id']]);audit('CREATE_JOIN_TOKEN');
+        $q=$p->prepare('INSERT INTO join_tokens(token,expires_at,created_by) VALUES(:t,:exp,:m)');$q->execute(['t'=>$token,'exp'=>gmdate('Y-m-d H:i:s',$exp),'m'=>$_SESSION['manager_id']]);audit('CREATE_JOIN_TOKEN');
         out(['token'=>$token,'expires_at'=>gmdate('c',$exp)]);
     }
 
