@@ -110,70 +110,323 @@ try {
     }
 
     if($path==='/api/employee/join' && $method==='POST'){
-        $b=body();$token=trim((string)($b['token']??''));$name=trim((string)($b['name']??''));$device=trim((string)($b['device_id']??''));$model=trim((string)($b['model']??''));
-        if(!$token||!$name||!$device)out(['joined'=>false,'error'=>'Name, token and device ID are required','missing'=>array_values(array_filter(['token'=>$token?'':'token','name'=>$name?'':'name','device_id'=>$device?'':'device_id']))],422);
+    $b=body();
 
-        // Validate the QR code before opening a write transaction. This avoids PostgreSQL
-        // 25P02 cascading errors when a read/constraint fails inside the transaction.
-        try {
-            $q=$p->prepare('SELECT id, used_at, expires_at FROM join_tokens WHERE token=:t LIMIT 1');
-            $q->execute(['t'=>$token]);
-            $jt=$q->fetch();
-            if(!$jt) out(['joined'=>false,'error'=>'Join code was not found. Generate a new QR code.'],400);
-            if($jt['used_at']!==null) out(['joined'=>false,'error'=>'This join code has already been used. Generate a new QR code.'],400);
-            $q=$p->prepare("SELECT id FROM join_tokens WHERE id=:id AND expires_at > (NOW() AT TIME ZONE 'UTC') LIMIT 1");
-            $q->execute(['id'=>$jt['id']]);
-            if(!$q->fetchColumn()) out(['joined'=>false,'error'=>'This join code has expired. Generate a new QR code.'],400);
-        } catch(Throwable $e) {
-            $info=$e instanceof PDOException ? $e->errorInfo : null;
-            error_log('EMPLOYEE JOIN VALIDATION ERROR: '.get_class($e).' | '.$e->getMessage().' | sqlstate='.($info[0]??'').' | detail='.($info[2]??'').' | token_prefix='.substr($token,0,8).' | device='.substr($device,0,32));
-            out(['joined'=>false,'error'=>'Could not validate the join code. Check the Render log.','request_id'=>substr(bin2hex(random_bytes(6)),0,12)],500);
-        }
+    $token=trim((string)($b['token']??''));
+    $name=trim((string)($b['name']??''));
+    $device=trim((string)($b['device_id']??''));
+    $model=trim((string)($b['model']??''));
 
-        // Keep the join transaction minimal. The previous implementation used a
-        // SELECT ... FOR UPDATE after validation; with some Neon/PgBouncer
-        // connection states that could surface as PostgreSQL 25P02. Claim the
-        // token atomically instead, then perform the employee/device write.
-        if($p->inTransaction()) {
-            try { $p->rollBack(); } catch(Throwable $ignored) {}
-        }
-        $p->beginTransaction();
-        $step='claim join token';
-        try{
-            $q=$p->prepare("UPDATE join_tokens SET used_at=NOW() WHERE id=:id AND used_at IS NULL AND expires_at > (NOW() AT TIME ZONE 'UTC') RETURNING id");
-            $q->execute(['id'=>$jt['id']]);
-            $claimed=$q->fetchColumn();
-            if(!$claimed) {
-                $p->rollBack();
-                out(['joined'=>false,'error'=>'This join code is no longer available. Generate a new QR code.'],400);
-            }
-
-            $step='find device';
-            $q=$p->prepare('SELECT id,employee_id FROM devices WHERE device_id=:d LIMIT 1');$q->execute(['d'=>$device]);$old=$q->fetch();
-            if($old){
-                $eid=(int)$old['employee_id'];
-                $step='update employee';
-                $p->prepare('UPDATE employees SET name=:n,active=1 WHERE id=:e')->execute(['n'=>$name,'e'=>$eid]);
-                $step='update device';
-                $p->prepare("UPDATE devices SET model=:model,last_seen=NOW(),call_state='READY',state_changed_at=NOW(),active=1 WHERE id=:id")->execute(['model'=>$model?:null,'id'=>$old['id']]);
-            } else {
-                $step='insert employee';
-                $q=$p->prepare('INSERT INTO employees(name) VALUES(:n) RETURNING id');$q->execute(['n'=>$name]);$eid=(int)$q->fetchColumn();
-                if($eid<=0)throw new RuntimeException('Employee record could not be created.');
-                $step='insert device';
-                $q=$p->prepare("INSERT INTO devices(employee_id,device_id,model,last_seen,call_state,state_changed_at) VALUES(:e,:d,:m,NOW(),'READY',NOW())");
-                $q->execute(['e'=>$eid,'d'=>$device,'m'=>$model?:null]);
-            }
-            $p->commit();
-            out(['joined'=>true,'employee_id'=>$eid,'device_id'=>$device,'message'=>'Phone connected successfully']);
-        }catch(Throwable $e){
-            if($p->inTransaction())$p->rollBack();
-            $info=$e instanceof PDOException ? $e->errorInfo : null;
-            error_log('EMPLOYEE JOIN ERROR: '.get_class($e).' | step='.$step.' | '.$e->getMessage().' | sqlstate='.($info[0]??'').' | detail='.($info[2]??'').' | token_prefix='.substr($token,0,8).' | device='.substr($device,0,32));
-            $msg=$e instanceof RuntimeException?$e->getMessage():'Could not register device. Join step: '.$step.'. Check the Render log.';
-            out(['joined'=>false,'error'=>$msg,'request_id'=>substr(bin2hex(random_bytes(6)),0,12)],400);
-        }
+    if(!$token||!$name||!$device){
+        out([
+            'joined'=>false,
+            'error'=>'Name, token and device ID are required',
+            'missing'=>array_values(array_filter([
+                'token'=>$token?'':'token',
+                'name'=>$name?'':'name',
+                'device_id'=>$device?'':'device_id'
+            ]))
+        ],422);
     }
+
+    /*
+     * IMPORTANT:
+     * Use a completely fresh PDO connection for employee joining.
+     *
+     * This avoids reusing a Neon/PgBouncer connection that may have
+     * been left in PostgreSQL's "current transaction is aborted" state.
+     */
+    global $config;
+
+    $joinPdo=null;
+    $step='create fresh join connection';
+
+    try{
+        $joinPdo=new PDO(
+            $config['db']['dsn'],
+            $config['db']['user'],
+            $config['db']['password'],
+            [
+                PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION,
+                PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC,
+                PDO::ATTR_EMULATE_PREPARES=>true
+            ]
+        );
+
+        /*
+         * Force-clear any failed transaction state on this fresh
+         * connection. ROLLBACK is harmless when no transaction exists.
+         */
+        try{
+            $joinPdo->exec('ROLLBACK');
+        }catch(Throwable $ignored){}
+
+        /*
+         * Test the connection BEFORE starting our transaction.
+         */
+        $step='test fresh connection';
+        $joinPdo->query('SELECT 1')->fetchColumn();
+
+        /*
+         * Validate token without opening a write transaction.
+         */
+        $step='find join token';
+        $q=$joinPdo->prepare(
+            'SELECT id, used_at, expires_at
+             FROM join_tokens
+             WHERE token=:t
+             LIMIT 1'
+        );
+        $q->execute(['t'=>$token]);
+        $jt=$q->fetch();
+
+        if(!$jt){
+            out([
+                'joined'=>false,
+                'error'=>'Join code was not found. Generate a new QR code.'
+            ],400);
+        }
+
+        if($jt['used_at']!==null){
+            out([
+                'joined'=>false,
+                'error'=>'This join code has already been used. Generate a new QR code.'
+            ],400);
+        }
+
+        /*
+         * Check expiration using PostgreSQL UTC time.
+         */
+        $step='check token expiry';
+        $q=$joinPdo->prepare(
+            "SELECT id
+             FROM join_tokens
+             WHERE id=:id
+               AND expires_at > (NOW() AT TIME ZONE 'UTC')
+             LIMIT 1"
+        );
+        $q->execute(['id'=>$jt['id']]);
+
+        if(!$q->fetchColumn()){
+            out([
+                'joined'=>false,
+                'error'=>'This join code has expired. Generate a new QR code.'
+            ],400);
+        }
+
+        /*
+         * Start a completely fresh transaction.
+         */
+        $step='begin join transaction';
+
+        if($joinPdo->inTransaction()){
+            try{$joinPdo->rollBack();}catch(Throwable $ignored){}
+        }
+
+        $joinPdo->beginTransaction();
+
+        /*
+         * Atomically claim the token.
+         */
+        $step='claim join token';
+
+        $q=$joinPdo->prepare(
+            "UPDATE join_tokens
+             SET used_at=NOW()
+             WHERE id=:id
+               AND used_at IS NULL
+               AND expires_at > (NOW() AT TIME ZONE 'UTC')
+             RETURNING id"
+        );
+
+        $q->execute(['id'=>$jt['id']]);
+        $claimed=$q->fetchColumn();
+
+        if(!$claimed){
+            $joinPdo->rollBack();
+
+            out([
+                'joined'=>false,
+                'error'=>'This join code is no longer available. Generate a new QR code.'
+            ],400);
+        }
+
+        /*
+         * Find whether this device already exists.
+         */
+        $step='find device';
+
+        $q=$joinPdo->prepare(
+            'SELECT id,employee_id
+             FROM devices
+             WHERE device_id=:d
+             LIMIT 1'
+        );
+        $q->execute(['d'=>$device]);
+        $old=$q->fetch();
+
+        if($old){
+            $eid=(int)$old['employee_id'];
+
+            /*
+             * Existing employee.
+             */
+            $step='update employee';
+
+            $q=$joinPdo->prepare(
+                'UPDATE employees
+                 SET name=:n, active=1
+                 WHERE id=:e'
+            );
+            $q->execute([
+                'n'=>$name,
+                'e'=>$eid
+            ]);
+
+            /*
+             * Existing device.
+             */
+            $step='update device';
+
+            $q=$joinPdo->prepare(
+                "UPDATE devices
+                 SET model=:model,
+                     last_seen=NOW(),
+                     call_state='READY',
+                     state_changed_at=NOW(),
+                     active=1
+                 WHERE id=:id"
+            );
+            $q->execute([
+                'model'=>$model?:null,
+                'id'=>$old['id']
+            ]);
+
+        }else{
+
+            /*
+             * New employee.
+             */
+            $step='insert employee';
+
+            $q=$joinPdo->prepare(
+                'INSERT INTO employees(name)
+                 VALUES(:n)
+                 RETURNING id'
+            );
+            $q->execute(['n'=>$name]);
+
+            $eid=(int)$q->fetchColumn();
+
+            if($eid<=0){
+                throw new RuntimeException(
+                    'Employee record could not be created.'
+                );
+            }
+
+            /*
+             * New device.
+             */
+            $step='insert device';
+
+            $q=$joinPdo->prepare(
+                "INSERT INTO devices(
+                    employee_id,
+                    device_id,
+                    model,
+                    last_seen,
+                    call_state,
+                    state_changed_at
+                 )
+                 VALUES(
+                    :e,
+                    :d,
+                    :m,
+                    NOW(),
+                    'READY',
+                    NOW()
+                 )"
+            );
+
+            $q->execute([
+                'e'=>$eid,
+                'd'=>$device,
+                'm'=>$model?:null
+            ]);
+        }
+
+        /*
+         * Everything succeeded.
+         */
+        $step='commit';
+
+        $joinPdo->commit();
+
+        out([
+            'joined'=>true,
+            'employee_id'=>$eid,
+            'device_id'=>$device,
+            'message'=>'Phone connected successfully'
+        ]);
+
+    }catch(Throwable $e){
+
+        /*
+         * Always roll back the dedicated connection if needed.
+         */
+        try{
+            if($joinPdo instanceof PDO && $joinPdo->inTransaction()){
+                $joinPdo->rollBack();
+            }
+        }catch(Throwable $rollbackError){
+            error_log(
+                'EMPLOYEE JOIN ROLLBACK ERROR: '.
+                get_class($rollbackError).
+                ' | '.
+                $rollbackError->getMessage()
+            );
+        }
+
+        $info=$e instanceof PDOException ? $e->errorInfo : null;
+
+        $requestId=substr(
+            bin2hex(random_bytes(6)),
+            0,
+            12
+        );
+
+        error_log(
+            'EMPLOYEE JOIN ERROR'.
+            ' | request_id='.$requestId.
+            ' | step='.$step.
+            ' | exception='.get_class($e).
+            ' | message='.$e->getMessage().
+            ' | sqlstate='.($info[0]??'').
+            ' | driver_code='.($info[1]??'').
+            ' | detail='.($info[2]??'').
+            ' | token_prefix='.substr($token,0,8).
+            ' | device='.substr($device,0,32)
+        );
+
+        $msg=
+            $e instanceof RuntimeException
+            ? $e->getMessage()
+            : 'Could not register device. Join step: '.$step.'.';
+
+        out([
+            'joined'=>false,
+            'error'=>$msg,
+            'request_id'=>$requestId
+        ],400);
+
+    }finally{
+
+        /*
+         * Close the dedicated PDO connection.
+         */
+        $joinPdo=null;
+    }
+}
 
     if($path==='/api/employee/status' && $method==='GET'){
         $device=trim((string)($_GET['device_id']??''));if(!$device)out(['joined'=>false,'error'=>'Device ID required'],422);
