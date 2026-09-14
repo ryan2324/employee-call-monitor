@@ -7,6 +7,7 @@ RUN apt-get update \
     && a2enmod rewrite headers \
     && rm -rf /var/lib/apt/lists/*
 
+
 WORKDIR /var/www/html
 
 COPY api /var/www/html/api
