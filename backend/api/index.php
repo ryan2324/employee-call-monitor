@@ -86,11 +86,6 @@ $method=$_SERVER['REQUEST_METHOD']??'GET';
 try {
     // Connect lazily so the health endpoint can report database errors instead of returning a blank/500 response.
     $p = db();
-    // Neon/PgBouncer may hand PHP a connection whose previous server-side
-    // transaction ended in an error. Clear any such failed transaction state
-    // before the first statement in this request. ROLLBACK is harmless when
-    // no transaction is active.
-    try { $p->exec('ROLLBACK'); } catch (Throwable $ignored) {}
     if(($path==='/api' || $path==='/api/' || $path==='/api/index.php' || $path==='/api/health') && $method==='GET'){
         try{$p->query('SELECT 1');$tables=[];foreach(['managers','employees','devices','call_history','daily_employee_stats'] as $t){$q=$p->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name=:t");$q->execute(['t'=>$t]);$tables[$t]=((int)$q->fetchColumn()>0);}
             out(['ok'=>true,'service'=>'employee-call-monitor-api','database'=>true,'tables'=>$tables,'php'=>PHP_VERSION,'api_base'=>$config['api_base_url'],'server_time'=>gmdate('c')]);
