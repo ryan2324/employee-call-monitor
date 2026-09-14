@@ -125,16 +125,23 @@ try {
             out(['joined'=>false,'error'=>'Could not validate the join code. Check the Render log.','request_id'=>substr(bin2hex(random_bytes(6)),0,12)],500);
         }
 
+        // Keep the join transaction minimal. The previous implementation used a
+        // SELECT ... FOR UPDATE after validation; with some Neon/PgBouncer
+        // connection states that could surface as PostgreSQL 25P02. Claim the
+        // token atomically instead, then perform the employee/device write.
+        if($p->inTransaction()) {
+            try { $p->rollBack(); } catch(Throwable $ignored) {}
+        }
         $p->beginTransaction();
-        $step='begin';
+        $step='claim join token';
         try{
-            // Re-lock the token inside the transaction to prevent two phones from using the same QR.
-            $step='lock join token';
-            $q=$p->prepare('SELECT id, used_at, expires_at FROM join_tokens WHERE id=:id FOR UPDATE');
-            $q->execute(['id'=>$jt['id']]);$locked=$q->fetch();
-            if(!$locked)throw new RuntimeException('Join code was not found. Generate a new QR code.');
-            if($locked['used_at']!==null)throw new RuntimeException('This join code has already been used. Generate a new QR code.');
-            if(strtotime((string)$locked['expires_at']) <= time())throw new RuntimeException('This join code has expired. Generate a new QR code.');
+            $q=$p->prepare("UPDATE join_tokens SET used_at=NOW() WHERE id=:id AND used_at IS NULL AND expires_at > (NOW() AT TIME ZONE 'UTC') RETURNING id");
+            $q->execute(['id'=>$jt['id']]);
+            $claimed=$q->fetchColumn();
+            if(!$claimed) {
+                $p->rollBack();
+                out(['joined'=>false,'error'=>'This join code is no longer available. Generate a new QR code.'],400);
+            }
 
             $step='find device';
             $q=$p->prepare('SELECT id,employee_id FROM devices WHERE device_id=:d LIMIT 1');$q->execute(['d'=>$device]);$old=$q->fetch();
@@ -152,8 +159,6 @@ try {
                 $q=$p->prepare("INSERT INTO devices(employee_id,device_id,model,last_seen,call_state,state_changed_at) VALUES(:e,:d,:m,NOW(),'READY',NOW())");
                 $q->execute(['e'=>$eid,'d'=>$device,'m'=>$model?:null]);
             }
-            $step='mark token used';
-            $p->prepare('UPDATE join_tokens SET used_at=NOW() WHERE id=:id')->execute(['id'=>$jt['id']]);
             $p->commit();
             out(['joined'=>true,'employee_id'=>$eid,'device_id'=>$device,'message'=>'Phone connected successfully']);
         }catch(Throwable $e){
