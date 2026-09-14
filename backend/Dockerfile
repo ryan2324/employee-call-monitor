@@ -1,6 +1,6 @@
 FROM php:8.3-apache
 
-# PostgreSQL development libraries are required for pdo_pgsql
+# Install PostgreSQL development libraries
 RUN apt-get update \
     && apt-get install -y --no-install-recommends libpq-dev \
     && docker-php-ext-install pdo_pgsql \
@@ -9,19 +9,25 @@ RUN apt-get update \
 
 WORKDIR /var/www/html
 
-COPY api /var/www/html/api
-COPY setup.php /var/www/html/setup.php
+# Copy the backend application
+COPY . /var/www/html/
 
-# Allow .htaccess to handle API routes
+# Apache configuration
 RUN printf '%s\n' \
     '<Directory /var/www/html>' \
+    '    Options FollowSymLinks' \
     '    AllowOverride All' \
     '    Require all granted' \
     '</Directory>' \
-    > /etc/apache2/conf-available/employee-monitor.conf \
-    && a2enconf employee-monitor
+    > /etc/apache2/conf-available/employee-call-monitor.conf \
+    && a2enconf employee-call-monitor
 
-# Give Apache access to the application
+# Make /api/* go directly to api/index.php
+RUN printf '%s\n' \
+    'RewriteEngine On' \
+    'RewriteRule ^api/(.*)$ /api/index.php [QSA,L]' \
+    > /var/www/html/.htaccess
+
 RUN chown -R www-data:www-data /var/www/html
 
 EXPOSE 80
