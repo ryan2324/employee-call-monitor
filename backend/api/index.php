@@ -430,25 +430,31 @@ try {
     }
     if($path==='/api/employee/command-ack' && $method==='POST'){
         $b=body();$id=(int)($b['command_id']??0);$device=trim((string)($b['device_id']??''));if($id<=0||$device==='')out(['ok'=>false,'error'=>'Command ID and device ID required'],422);
-        $p->beginTransaction();
+        // IMPORTANT: keep ACK autocommit. A failed statement inside a PostgreSQL
+        // transaction leaves that transaction aborted (25P02), which previously made
+        // the warning impossible to acknowledge and caused the Android client to poll
+        // and display the same warning repeatedly.
         try{
-            $q=$p->prepare('SELECT command_type FROM warning_commands WHERE id=:i AND device_id=:d FOR UPDATE');$q->execute(['i'=>$id,'d'=>$device]);$type=$q->fetchColumn();
-            if($type===false){$p->rollBack();out(['ok'=>false,'error'=>'Warning command not found'],404);}
-            $q=$p->prepare('UPDATE warning_commands SET acknowledged_at=COALESCE(acknowledged_at,NOW()) WHERE id=:i AND device_id=:d');$q->execute(['i'=>$id,'d'=>$device]);
-            // Acknowledging an automatic idle warning resets the idle clock. The next
-            // automatic warning is therefore scheduled for the full manager-selected
-            // interval, instead of immediately repeating the same warning.
+            $q=$p->prepare("UPDATE warning_commands SET acknowledged_at=COALESCE(acknowledged_at,NOW()) WHERE id=:i AND device_id=:d RETURNING command_type");
+            $q->execute(['i'=>$id,'d'=>$device]);
+            $type=$q->fetchColumn();
+            if($type===false)out(['ok'=>false,'error'=>'Warning command not found'],404);
+
             if($type==='AUTO_IDLE_WARNING' || $type==='IDLE_WARNING'){
-                // Any acknowledged warning starts a fresh idle period. In particular,
-                // a manually sent warning must not be followed by an automatic warning
-                // on the next idle-check just because the old idle timer had expired.
+                // Clear any remaining automatic warning for this same idle period and
+                // restart the idle clock. Each statement is autocommit and independent.
                 if($type==='AUTO_IDLE_WARNING'){
-                    $q=$p->prepare("UPDATE warning_commands SET acknowledged_at=NOW() WHERE device_id=:d AND command_type='AUTO_IDLE_WARNING' AND acknowledged_at IS NULL");$q->execute(['d'=>$device]);
+                    $q=$p->prepare("UPDATE warning_commands SET acknowledged_at=NOW() WHERE device_id=:d AND command_type='AUTO_IDLE_WARNING' AND acknowledged_at IS NULL");
+                    $q->execute(['d'=>$device]);
                 }
-                $q=$p->prepare("UPDATE devices SET state_changed_at=NOW() WHERE device_id=:d AND active=1 AND call_state='READY'");$q->execute(['d'=>$device]);
+                $q=$p->prepare("UPDATE devices SET state_changed_at=NOW() WHERE device_id=:d AND active=1 AND call_state='READY'");
+                $q->execute(['d'=>$device]);
             }
-            $p->commit();out(['ok'=>true,'reset_idle_timer'=>$type==='AUTO_IDLE_WARNING']);
-        }catch(Throwable $e){if($p->inTransaction())$p->rollBack();throw $e;}
+            out(['ok'=>true,'reset_idle_timer'=>true,'command_type'=>$type]);
+        }catch(Throwable $e){
+            error_log('WARNING ACK ERROR: '.get_class($e).' | SQLSTATE='.($e instanceof PDOException?$e->getCode():'').' | detail='.$e->getMessage().' | command_id='.$id.' | device='.substr($device,0,16));
+            throw $e;
+        }
     }
 
     if($path==='/api/diagnostic' && $method==='GET'){
