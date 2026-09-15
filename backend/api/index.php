@@ -35,7 +35,8 @@ function db(): PDO {
     $pdo=new PDO($config['db']['dsn'],$config['db']['user'],$config['db']['password'],[
         PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION,
         PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC,
-        PDO::ATTR_EMULATE_PREPARES=>false
+        PDO::ATTR_EMULATE_PREPARES=>false,
+        PDO::ATTR_PERSISTENT=>true
     ]); return $pdo;
 }
 function hasColumn(PDO $p,string $table,string $column): bool {
@@ -232,13 +233,13 @@ try {
 
     if($path==='/api/dashboard' && $method==='GET'){
         manager();
-        $succ=hasColumn($p,'daily_employee_stats','successful_calls_today')?'COALESCE(s.successful_calls_today,0)':'0'; $fail=hasColumn($p,'daily_employee_stats','unsuccessful_calls_today')?'COALESCE(s.unsuccessful_calls_today,0)':'0'; $rows=$p->query("SELECT e.id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(s.calls_today,0) calls_today,$succ successful_calls_today,$fail unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=CURRENT_DATE WHERE e.active=1 ORDER BY e.name")->fetchAll();
+        $rows=$p->query("SELECT e.id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=CURRENT_DATE WHERE e.active=1 ORDER BY e.name")->fetchAll();
         foreach($rows as &$r){$r['computed_status']=statusFor($r);}unset($r);out(['employees'=>$rows,'server_time'=>gmdate('c')]);
     }
 
     if($path==='/api/employee/detail' && $method==='GET'){
         manager();$id=(int)($_GET['id']??0);if(!$id)out(['error'=>'Employee ID required'],422);
-        $succ=hasColumn($p,'daily_employee_stats','successful_calls_today')?'COALESCE(s.successful_calls_today,0)':'0'; $fail=hasColumn($p,'daily_employee_stats','unsuccessful_calls_today')?'COALESCE(s.unsuccessful_calls_today,0)':'0';$q=$p->prepare("SELECT e.id,e.name,e.department,e.active,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(s.calls_today,0) calls_today,$succ successful_calls_today,$fail unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=CURRENT_DATE WHERE e.id=:id LIMIT 1");$q->execute(['id'=>$id]);$e=$q->fetch();if(!$e)out(['error'=>'Employee not found'],404);$e['computed_status']=statusFor($e);
+        $q=$p->prepare("SELECT e.id,e.name,e.department,e.active,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=CURRENT_DATE WHERE e.id=:id LIMIT 1");$q->execute(['id'=>$id]);$e=$q->fetch();if(!$e)out(['error'=>'Employee not found'],404);$e['computed_status']=statusFor($e);
         $q=$p->prepare("SELECT id,contact_number,result,direction,started_at,ended_at,duration_seconds FROM call_history WHERE employee_id=:id ORDER BY started_at DESC LIMIT 100");$q->execute(['id'=>$id]);$e['recent_calls']=$q->fetchAll();out(['employee'=>$e]);
     }
 
