@@ -2535,230 +2535,121 @@ if (
 
     $b = body();
 
-    $employeeId =
-        (int)(
-            $b['employee_id'] ??
-            0
-        );
+    $employeeId = (int)($b['employee_id'] ?? 0);
+    $deviceId = trim((string)($b['device_id'] ?? ''));
+    $message = trim((string)(
+        $b['message'] ??
+        'You have been warned. Please resume calling now.'
+    ));
 
-    $deviceId =
-        trim(
-            (string)(
-                $b['device_id'] ??
-                ''
-            )
-        );
-
-    $message =
-        trim(
-            (string)(
-                $b['message'] ??
-                'You have been warned. Please resume calling now.'
-            )
-        );
-
-    if (!$employeeId) {
-
+    if ($employeeId <= 0) {
         out([
             'ok' => false,
-            'error' =>
-                'Employee ID is required'
+            'error' => 'Employee ID is required'
         ], 422);
     }
 
-    /*
-     * Start transaction so multiple rapid clicks
-     * cannot create multiple warnings.
-     */
-    $p->beginTransaction();
+    if ($message === '') {
+        $message = 'You have been warned. Please resume calling now.';
+    }
 
     try {
-
         /*
-         * If device_id was not supplied by the dashboard,
-         * automatically find the employee's active device.
+         * The manager dashboard normally sends employee_id only.
+         * Resolve the currently active device here.
+         *
+         * This route deliberately does NOT require the newer
+         * idle_warning_acknowledged column, so manual warnings keep
+         * working even if the database migration has not been run.
          */
         if ($deviceId === '') {
-
-            $q = $p->prepare("
-                SELECT
-                    device_id
-                FROM devices
-                WHERE employee_id = :e
-                  AND active = 1
-                ORDER BY id DESC
-                LIMIT 1
-                FOR UPDATE
-            ");
-
-            $q->execute([
-                'e' => $employeeId
-            ]);
-
-            $deviceId =
-                (string)$q->fetchColumn();
+            $q = $p->prepare("\n                SELECT device_id\n                FROM devices\n                WHERE employee_id = :e\n                  AND active = 1\n                ORDER BY id DESC\n                LIMIT 1\n            ");
+            $q->execute(['e' => $employeeId]);
+            $deviceId = trim((string)$q->fetchColumn());
         }
 
-        /*
-         * Device still not found.
-         */
         if ($deviceId === '') {
-
-            $p->rollBack();
-
             out([
                 'ok' => false,
-                'error' =>
-                    'No active device is connected to this employee'
+                'error' => 'No active device is connected to this employee'
             ], 404);
         }
 
-        /*
-         * Lock the device row.
-         *
-         * This is important because the manager may click
-         * the warning button several times very quickly.
-         */
-        $q = $p->prepare("
-            SELECT
-                id,
-                employee_id,
-                device_id,
-                active
-            FROM devices
-            WHERE device_id = :d
-              AND employee_id = :e
-              AND active = 1
-            LIMIT 1
-            FOR UPDATE
-        ");
-
+        /* Confirm that the device belongs to this employee. */
+        $q = $p->prepare("\n            SELECT id, employee_id, device_id\n            FROM devices\n            WHERE device_id = :d\n              AND employee_id = :e\n              AND active = 1\n            LIMIT 1\n        ");
         $q->execute([
             'd' => $deviceId,
             'e' => $employeeId
         ]);
-
-        $device =
-            $q->fetch();
+        $device = $q->fetch();
 
         if (!$device) {
-
-            $p->rollBack();
-
             out([
                 'ok' => false,
-                'error' =>
-                    'Employee device is not registered or is inactive'
+                'error' => 'Employee device is not registered or is inactive'
             ], 404);
         }
 
         /*
-         * Check if ANY warning is currently pending.
-         *
-         * This includes:
-         *
-         *   IDLE_WARNING
-         *   AUTO_IDLE_WARNING
-         *
-         * Therefore a manual warning cannot stack on top
-         * of an automatic warning, and vice versa.
+         * One pending warning per device.
+         * Manual and automatic warnings share warning_commands.
          */
-        $q = $p->prepare("
-            SELECT
-                id,
-                command_type
-            FROM warning_commands
-            WHERE device_id = :d
-              AND acknowledged_at IS NULL
-            ORDER BY id DESC
-            LIMIT 1
-        ");
-
-        $q->execute([
-            'd' => $deviceId
-        ]);
-
-        $existing =
-            $q->fetch();
+        $q = $p->prepare("\n            SELECT id, command_type\n            FROM warning_commands\n            WHERE device_id = :d\n              AND acknowledged_at IS NULL\n            ORDER BY id DESC\n            LIMIT 1\n        ");
+        $q->execute(['d' => $deviceId]);
+        $existing = $q->fetch();
 
         if ($existing) {
-
-            $p->commit();
-
             out([
                 'ok' => true,
                 'already_pending' => true,
-                'warning_id' =>
-                    (int)$existing['id'],
-                'device_id' =>
-                    $deviceId,
-                'message' =>
-                    'A warning is already pending for this employee.'
+                'warning_id' => (int)$existing['id'],
+                'employee_id' => $employeeId,
+                'device_id' => $deviceId,
+                'message' => 'A warning is already pending for this employee.'
             ]);
         }
 
-        /*
-         * Create ONE warning.
-         */
-        $q = $p->prepare("
-            INSERT INTO warning_commands(
-                employee_id,
-                device_id,
-                command_type,
-                message
-            )
-            VALUES(
-                :e,
-                :d,
-                'IDLE_WARNING',
-                :m
-            )
-            RETURNING id
-        ");
-
+        $q = $p->prepare("\n            INSERT INTO warning_commands(\n                employee_id,\n                device_id,\n                command_type,\n                message\n            )\n            VALUES(\n                :e,\n                :d,\n                'IDLE_WARNING',\n                :m\n            )\n            RETURNING id\n        ");
         $q->execute([
             'e' => $employeeId,
             'd' => $deviceId,
             'm' => $message
         ]);
 
-        $warningId =
-            (int)$q->fetchColumn();
+        $warningId = (int)$q->fetchColumn();
 
-        $p->commit();
-
-        audit(
-            'MANUAL_EMPLOYEE_WARNING',
-            [
-                'employee_id' =>
-                    $employeeId,
-                'device_id' =>
-                    $deviceId,
-                'warning_id' =>
-                    $warningId
-            ]
-        );
+        audit('MANUAL_EMPLOYEE_WARNING', [
+            'employee_id' => $employeeId,
+            'device_id' => $deviceId,
+            'warning_id' => $warningId
+        ]);
 
         out([
             'ok' => true,
             'already_pending' => false,
-            'warning_id' =>
-                $warningId,
-            'employee_id' =>
-                $employeeId,
-            'device_id' =>
-                $deviceId,
-            'message' =>
-                'Warning sent successfully.'
+            'warning_id' => $warningId,
+            'employee_id' => $employeeId,
+            'device_id' => $deviceId,
+            'message' => 'Warning sent successfully.'
         ]);
 
     } catch (Throwable $e) {
+        error_log(
+            'MANUAL WARNING ERROR: ' .
+            get_class($e) .
+            ' | ' .
+            $e->getMessage()
+        );
 
-        if ($p->inTransaction()) {
-            $p->rollBack();
-        }
+        $detail = $e->getMessage();
+        $info = $e instanceof PDOException ? $e->errorInfo : null;
 
-        throw $e;
+        out([
+            'ok' => false,
+            'error' => 'Could not send warning',
+            'detail' => $detail,
+            'sqlstate' => $info[0] ?? null
+        ], 500);
     }
 }
 
