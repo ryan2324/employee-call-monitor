@@ -394,7 +394,13 @@ try {
         $q=$p->prepare('SELECT e.id,d.device_id FROM employees e JOIN devices d ON d.employee_id=e.id AND d.active=1 WHERE e.id=:id LIMIT 1');$q->execute(['id'=>$id]);$e=$q->fetch();if(!$e)out(['error'=>'Employee or active device not found'],404);
         $q=$p->prepare("SELECT id FROM warning_commands WHERE device_id=:d AND acknowledged_at IS NULL ORDER BY id LIMIT 1");$q->execute(['d'=>$e['device_id']]);
         if($q->fetchColumn()) out(['ok'=>true,'queued'=>false,'already_pending'=>true]);
-        $q=$p->prepare("INSERT INTO warning_commands(employee_id,device_id,command_type,message) VALUES(:e,:d,'IDLE_WARNING',:m)");$q->execute(['e'=>$id,'d'=>$e['device_id'],'m'=>mb_substr($msg,0,255)]);audit('WARN_EMPLOYEE',['employee_id'=>$id]);out(['ok'=>true,'queued'=>true]);
+        $q=$p->prepare("INSERT INTO warning_commands(employee_id,device_id,command_type,message) VALUES(:e,:d,'IDLE_WARNING',:m)");$q->execute(['e'=>$id,'d'=>$e['device_id'],'m'=>mb_substr($msg,0,255)]);
+        // A manual warning starts a fresh idle period. Without this reset, if the
+        // employee had already exceeded the automatic-warning threshold, the next
+        // 5-second idle-check could immediately create AUTO_IDLE_WARNING after the
+        // manual warning is acknowledged.
+        $q=$p->prepare("UPDATE devices SET state_changed_at=NOW() WHERE device_id=:d AND active=1 AND call_state='READY'");$q->execute(['d'=>$e['device_id']]);
+        audit('WARN_EMPLOYEE',['employee_id'=>$id]);out(['ok'=>true,'queued'=>true]);
     }
     if($path==='/api/employee/commands' && $method==='GET'){
         $device=trim((string)($_GET['device_id']??''));
@@ -432,11 +438,13 @@ try {
             // Acknowledging an automatic idle warning resets the idle clock. The next
             // automatic warning is therefore scheduled for the full manager-selected
             // interval, instead of immediately repeating the same warning.
-            if($type==='AUTO_IDLE_WARNING'){
-                // Acknowledge/clear every queued automatic warning for this idle
-                // period, restart the idle clock from zero, and clear the one-warning latch.
-                // The next warning is allowed only after the full manager-selected interval.
-                $q=$p->prepare("UPDATE warning_commands SET acknowledged_at=NOW() WHERE device_id=:d AND command_type='AUTO_IDLE_WARNING' AND acknowledged_at IS NULL");$q->execute(['d'=>$device]);
+            if($type==='AUTO_IDLE_WARNING' || $type==='IDLE_WARNING'){
+                // Any acknowledged warning starts a fresh idle period. In particular,
+                // a manually sent warning must not be followed by an automatic warning
+                // on the next idle-check just because the old idle timer had expired.
+                if($type==='AUTO_IDLE_WARNING'){
+                    $q=$p->prepare("UPDATE warning_commands SET acknowledged_at=NOW() WHERE device_id=:d AND command_type='AUTO_IDLE_WARNING' AND acknowledged_at IS NULL");$q->execute(['d'=>$device]);
+                }
                 $q=$p->prepare("UPDATE devices SET state_changed_at=NOW() WHERE device_id=:d AND active=1 AND call_state='READY'");$q->execute(['d'=>$device]);
             }
             $p->commit();out(['ok'=>true,'reset_idle_timer'=>$type==='AUTO_IDLE_WARNING']);
