@@ -30,6 +30,26 @@ if (($_SERVER['REQUEST_METHOD'] ?? '') === 'OPTIONS') { http_response_code(204);
 function body(): array { $v=json_decode(file_get_contents('php://input') ?: '{}', true); return is_array($v)?$v:[]; }
 function out(array $v,int $status=200): never { http_response_code($status); echo json_encode($v,JSON_UNESCAPED_SLASHES|JSON_UNESCAPED_UNICODE); exit; }
 function manager(): void { if (empty($_SESSION['manager_id'])) out(['error'=>'Unauthorized'],401); }
+function ensureSettingsTable(PDO $p): void {
+    static $done=false; if($done) return;
+    $p->exec("CREATE TABLE IF NOT EXISTS app_settings (setting_key VARCHAR(100) PRIMARY KEY, setting_value VARCHAR(255) NOT NULL, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)");
+    $p->exec("INSERT INTO app_settings(setting_key,setting_value) VALUES ('auto_idle_warning_minutes','0') ON CONFLICT (setting_key) DO NOTHING");
+    $done=true;
+}
+function autoIdleWarning(PDO $p,int $employeeId,string $deviceId,string $state): void {
+    if($state!=='READY' || !$employeeId || !$deviceId) return;
+    ensureSettingsTable($p);
+    $q=$p->prepare("SELECT setting_value FROM app_settings WHERE setting_key='auto_idle_warning_minutes' LIMIT 1"); $q->execute();
+    $minutes=max(0,min(240,(int)$q->fetchColumn())); if($minutes<=0) return;
+    $q=$p->prepare("SELECT state_changed_at FROM devices WHERE device_id=:d AND active=1 LIMIT 1"); $q->execute(['d'=>$deviceId]); $changed=$q->fetchColumn();
+    if(!$changed) return; $changedTs=strtotime((string)$changed.' UTC');
+    if($changedTs===false || time()-$changedTs < $minutes*60) return;
+    $q=$p->prepare("SELECT id FROM warning_commands WHERE device_id=:d AND command_type='AUTO_IDLE_WARNING' AND created_at >= :changed LIMIT 1");
+    $q->execute(['d'=>$deviceId,'changed'=>date('Y-m-d H:i:s',$changedTs)]); if($q->fetchColumn()) return;
+    $msg='You have been idle for '.$minutes.' minute'.($minutes===1?'':'s').'. Please resume calling now.';
+    $q=$p->prepare("INSERT INTO warning_commands(employee_id,device_id,command_type,message) VALUES(:e,:d,'AUTO_IDLE_WARNING',:m)"); $q->execute(['e'=>$employeeId,'d'=>$deviceId,'m'=>$msg]);
+}
+
 function db(): PDO {
     global $config; static $pdo=null; if($pdo instanceof PDO) return $pdo;
     $pdo=new PDO($config['db']['dsn'],$config['db']['user'],$config['db']['password'],[
@@ -117,6 +137,13 @@ try {
     }
     if($path==='/api/auth/logout' && $method==='POST'){audit('LOGOUT');$_SESSION=[];session_destroy();out(['ok'=>true]);}
 
+    if($path==='/api/settings/auto-idle-warning' && $method==='GET'){
+        manager(); ensureSettingsTable($p); $q=$p->prepare("SELECT setting_value FROM app_settings WHERE setting_key='auto_idle_warning_minutes' LIMIT 1");$q->execute();$minutes=max(0,min(240,(int)$q->fetchColumn()));out(['minutes'=>$minutes]);
+    }
+    if($path==='/api/settings/auto-idle-warning' && $method==='POST'){
+        manager(); ensureSettingsTable($p); $b=body();$minutes=max(0,min(240,(int)($b['minutes']??0)));$q=$p->prepare("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES('auto_idle_warning_minutes',:v,NOW()) ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW()");$q->execute(['v'=>(string)$minutes]);audit('SET_AUTO_IDLE_WARNING',['minutes'=>$minutes]);out(['ok'=>true,'minutes'=>$minutes]);
+    }
+
     if($path==='/api/join/token' && $method==='POST'){
         manager();$token=bin2hex(random_bytes(16));$exp=time()+(int)$config['app']['join_token_minutes']*60;
         $q=$p->prepare('INSERT INTO join_tokens(token,expires_at,created_by) VALUES(:t,:exp,:m)');$q->execute(['t'=>$token,'exp'=>gmdate('Y-m-d H:i:s',$exp),'m'=>$_SESSION['manager_id']]);audit('CREATE_JOIN_TOKEN');
@@ -124,323 +151,70 @@ try {
     }
 
     if($path==='/api/employee/join' && $method==='POST'){
-    $b=body();
+        $b=body();$token=trim((string)($b['token']??''));$name=trim((string)($b['name']??''));$device=trim((string)($b['device_id']??''));$model=trim((string)($b['model']??''));
+        if(!$token||!$name||!$device)out(['joined'=>false,'error'=>'Name, token and device ID are required','missing'=>array_values(array_filter(['token'=>$token?'':'token','name'=>$name?'':'name','device_id'=>$device?'':'device_id']))],422);
 
-    $token=trim((string)($b['token']??''));
-    $name=trim((string)($b['name']??''));
-    $device=trim((string)($b['device_id']??''));
-    $model=trim((string)($b['model']??''));
-
-    if(!$token||!$name||!$device){
-        out([
-            'joined'=>false,
-            'error'=>'Name, token and device ID are required',
-            'missing'=>array_values(array_filter([
-                'token'=>$token?'':'token',
-                'name'=>$name?'':'name',
-                'device_id'=>$device?'':'device_id'
-            ]))
-        ],422);
-    }
-
-    /*
-     * IMPORTANT:
-     * Use a completely fresh PDO connection for employee joining.
-     *
-     * This avoids reusing a Neon/PgBouncer connection that may have
-     * been left in PostgreSQL's "current transaction is aborted" state.
-     */
-    global $config;
-
-    $joinPdo=null;
-    $step='create fresh join connection';
-
-    try{
-        $joinPdo=new PDO(
-            $config['db']['dsn'],
-            $config['db']['user'],
-            $config['db']['password'],
-            [
-                PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION,
-                PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC,
-                PDO::ATTR_EMULATE_PREPARES=>true
-            ]
-        );
-
-        /*
-         * Force-clear any failed transaction state on this fresh
-         * connection. ROLLBACK is harmless when no transaction exists.
-         */
-        try{
-            $joinPdo->exec('ROLLBACK');
-        }catch(Throwable $ignored){}
-
-        /*
-         * Test the connection BEFORE starting our transaction.
-         */
-        $step='test fresh connection';
-        $joinPdo->query('SELECT 1')->fetchColumn();
-
-        /*
-         * Validate token without opening a write transaction.
-         */
-        $step='find join token';
-        $q=$joinPdo->prepare(
-            'SELECT id, used_at, expires_at
-             FROM join_tokens
-             WHERE token=:t
-             LIMIT 1'
-        );
-        $q->execute(['t'=>$token]);
-        $jt=$q->fetch();
-
-        if(!$jt){
-            out([
-                'joined'=>false,
-                'error'=>'Join code was not found. Generate a new QR code.'
-            ],400);
+        // Validate the QR code before opening a write transaction. This avoids PostgreSQL
+        // 25P02 cascading errors when a read/constraint fails inside the transaction.
+        try {
+            $q=$p->prepare('SELECT id, used_at, expires_at FROM join_tokens WHERE token=:t LIMIT 1');
+            $q->execute(['t'=>$token]);
+            $jt=$q->fetch();
+            if(!$jt) out(['joined'=>false,'error'=>'Join code was not found. Generate a new QR code.'],400);
+            if($jt['used_at']!==null) out(['joined'=>false,'error'=>'This join code has already been used. Generate a new QR code.'],400);
+            $q=$p->prepare("SELECT id FROM join_tokens WHERE id=:id AND expires_at > (NOW() AT TIME ZONE 'UTC') LIMIT 1");
+            $q->execute(['id'=>$jt['id']]);
+            if(!$q->fetchColumn()) out(['joined'=>false,'error'=>'This join code has expired. Generate a new QR code.'],400);
+        } catch(Throwable $e) {
+            $info=$e instanceof PDOException ? $e->errorInfo : null;
+            error_log('EMPLOYEE JOIN VALIDATION ERROR: '.get_class($e).' | '.$e->getMessage().' | sqlstate='.($info[0]??'').' | detail='.($info[2]??'').' | token_prefix='.substr($token,0,8).' | device='.substr($device,0,32));
+            out(['joined'=>false,'error'=>'Could not validate the join code. Check the Render log.','request_id'=>substr(bin2hex(random_bytes(6)),0,12)],500);
         }
 
-        if($jt['used_at']!==null){
-            out([
-                'joined'=>false,
-                'error'=>'This join code has already been used. Generate a new QR code.'
-            ],400);
+        // Keep the join transaction minimal. The previous implementation used a
+        // SELECT ... FOR UPDATE after validation; with some Neon/PgBouncer
+        // connection states that could surface as PostgreSQL 25P02. Claim the
+        // token atomically instead, then perform the employee/device write.
+        if($p->inTransaction()) {
+            try { $p->rollBack(); } catch(Throwable $ignored) {}
         }
-
-        /*
-         * Check expiration using PostgreSQL UTC time.
-         */
-        $step='check token expiry';
-        $q=$joinPdo->prepare(
-            "SELECT id
-             FROM join_tokens
-             WHERE id=:id
-               AND expires_at > (NOW() AT TIME ZONE 'UTC')
-             LIMIT 1"
-        );
-        $q->execute(['id'=>$jt['id']]);
-
-        if(!$q->fetchColumn()){
-            out([
-                'joined'=>false,
-                'error'=>'This join code has expired. Generate a new QR code.'
-            ],400);
-        }
-
-        /*
-         * Start a completely fresh transaction.
-         */
-        $step='begin join transaction';
-
-        if($joinPdo->inTransaction()){
-            try{$joinPdo->rollBack();}catch(Throwable $ignored){}
-        }
-
-        $joinPdo->beginTransaction();
-
-        /*
-         * Atomically claim the token.
-         */
+        $p->beginTransaction();
         $step='claim join token';
-
-        $q=$joinPdo->prepare(
-            "UPDATE join_tokens
-             SET used_at=NOW()
-             WHERE id=:id
-               AND used_at IS NULL
-               AND expires_at > (NOW() AT TIME ZONE 'UTC')
-             RETURNING id"
-        );
-
-        $q->execute(['id'=>$jt['id']]);
-        $claimed=$q->fetchColumn();
-
-        if(!$claimed){
-            $joinPdo->rollBack();
-
-            out([
-                'joined'=>false,
-                'error'=>'This join code is no longer available. Generate a new QR code.'
-            ],400);
-        }
-
-        /*
-         * Find whether this device already exists.
-         */
-        $step='find device';
-
-        $q=$joinPdo->prepare(
-            'SELECT id,employee_id
-             FROM devices
-             WHERE device_id=:d
-             LIMIT 1'
-        );
-        $q->execute(['d'=>$device]);
-        $old=$q->fetch();
-
-        if($old){
-            $eid=(int)$old['employee_id'];
-
-            /*
-             * Existing employee.
-             */
-            $step='update employee';
-
-            $q=$joinPdo->prepare(
-                'UPDATE employees
-                 SET name=:n, active=1
-                 WHERE id=:e'
-            );
-            $q->execute([
-                'n'=>$name,
-                'e'=>$eid
-            ]);
-
-            /*
-             * Existing device.
-             */
-            $step='update device';
-
-            $q=$joinPdo->prepare(
-                "UPDATE devices
-                 SET model=:model,
-                     last_seen=NOW(),
-                     call_state='READY',
-                     state_changed_at=NOW(),
-                     active=1
-                 WHERE id=:id"
-            );
-            $q->execute([
-                'model'=>$model?:null,
-                'id'=>$old['id']
-            ]);
-
-        }else{
-
-            /*
-             * New employee.
-             */
-            $step='insert employee';
-
-            $q=$joinPdo->prepare(
-                'INSERT INTO employees(name)
-                 VALUES(:n)
-                 RETURNING id'
-            );
-            $q->execute(['n'=>$name]);
-
-            $eid=(int)$q->fetchColumn();
-
-            if($eid<=0){
-                throw new RuntimeException(
-                    'Employee record could not be created.'
-                );
-            }
-
-            /*
-             * New device.
-             */
-            $step='insert device';
-
-            $q=$joinPdo->prepare(
-                "INSERT INTO devices(
-                    employee_id,
-                    device_id,
-                    model,
-                    last_seen,
-                    call_state,
-                    state_changed_at
-                 )
-                 VALUES(
-                    :e,
-                    :d,
-                    :m,
-                    NOW(),
-                    'READY',
-                    NOW()
-                 )"
-            );
-
-            $q->execute([
-                'e'=>$eid,
-                'd'=>$device,
-                'm'=>$model?:null
-            ]);
-        }
-
-        /*
-         * Everything succeeded.
-         */
-        $step='commit';
-
-        $joinPdo->commit();
-
-        out([
-            'joined'=>true,
-            'employee_id'=>$eid,
-            'device_id'=>$device,
-            'message'=>'Phone connected successfully'
-        ]);
-
-    }catch(Throwable $e){
-
-        /*
-         * Always roll back the dedicated connection if needed.
-         */
         try{
-            if($joinPdo instanceof PDO && $joinPdo->inTransaction()){
-                $joinPdo->rollBack();
+            $q=$p->prepare("UPDATE join_tokens SET used_at=NOW() WHERE id=:id AND used_at IS NULL AND expires_at > (NOW() AT TIME ZONE 'UTC') RETURNING id");
+            $q->execute(['id'=>$jt['id']]);
+            $claimed=$q->fetchColumn();
+            if(!$claimed) {
+                $p->rollBack();
+                out(['joined'=>false,'error'=>'This join code is no longer available. Generate a new QR code.'],400);
             }
-        }catch(Throwable $rollbackError){
-            error_log(
-                'EMPLOYEE JOIN ROLLBACK ERROR: '.
-                get_class($rollbackError).
-                ' | '.
-                $rollbackError->getMessage()
-            );
+
+            $step='find device';
+            $q=$p->prepare('SELECT id,employee_id FROM devices WHERE device_id=:d LIMIT 1');$q->execute(['d'=>$device]);$old=$q->fetch();
+            if($old){
+                $eid=(int)$old['employee_id'];
+                $step='update employee';
+                $p->prepare('UPDATE employees SET name=:n,active=1 WHERE id=:e')->execute(['n'=>$name,'e'=>$eid]);
+                $step='update device';
+                $p->prepare("UPDATE devices SET model=:model,last_seen=NOW(),call_state='READY',state_changed_at=NOW(),active=1 WHERE id=:id")->execute(['model'=>$model?:null,'id'=>$old['id']]);
+            } else {
+                $step='insert employee';
+                $q=$p->prepare('INSERT INTO employees(name) VALUES(:n) RETURNING id');$q->execute(['n'=>$name]);$eid=(int)$q->fetchColumn();
+                if($eid<=0)throw new RuntimeException('Employee record could not be created.');
+                $step='insert device';
+                $q=$p->prepare("INSERT INTO devices(employee_id,device_id,model,last_seen,call_state,state_changed_at) VALUES(:e,:d,:m,NOW(),'READY',NOW())");
+                $q->execute(['e'=>$eid,'d'=>$device,'m'=>$model?:null]);
+            }
+            $p->commit();
+            out(['joined'=>true,'employee_id'=>$eid,'device_id'=>$device,'message'=>'Phone connected successfully']);
+        }catch(Throwable $e){
+            if($p->inTransaction())$p->rollBack();
+            $info=$e instanceof PDOException ? $e->errorInfo : null;
+            error_log('EMPLOYEE JOIN ERROR: '.get_class($e).' | step='.$step.' | '.$e->getMessage().' | sqlstate='.($info[0]??'').' | detail='.($info[2]??'').' | token_prefix='.substr($token,0,8).' | device='.substr($device,0,32));
+            $msg=$e instanceof RuntimeException?$e->getMessage():'Could not register device. Join step: '.$step.'. Check the Render log.';
+            out(['joined'=>false,'error'=>$msg,'request_id'=>substr(bin2hex(random_bytes(6)),0,12)],400);
         }
-
-        $info=$e instanceof PDOException ? $e->errorInfo : null;
-
-        $requestId=substr(
-            bin2hex(random_bytes(6)),
-            0,
-            12
-        );
-
-        error_log(
-            'EMPLOYEE JOIN ERROR'.
-            ' | request_id='.$requestId.
-            ' | step='.$step.
-            ' | exception='.get_class($e).
-            ' | message='.$e->getMessage().
-            ' | sqlstate='.($info[0]??'').
-            ' | driver_code='.($info[1]??'').
-            ' | detail='.($info[2]??'').
-            ' | token_prefix='.substr($token,0,8).
-            ' | device='.substr($device,0,32)
-        );
-
-        $msg=
-            $e instanceof RuntimeException
-            ? $e->getMessage()
-            : 'Could not register device. Join step: '.$step.'.';
-
-        out([
-            'joined'=>false,
-            'error'=>$msg,
-            'request_id'=>$requestId
-        ],400);
-
-    }finally{
-
-        /*
-         * Close the dedicated PDO connection.
-         */
-        $joinPdo=null;
     }
-}
 
     if($path==='/api/employee/status' && $method==='GET'){
         $device=trim((string)($_GET['device_id']??''));if(!$device)out(['joined'=>false,'error'=>'Device ID required'],422);
@@ -453,7 +227,9 @@ try {
         if(!$device)out(['ok'=>false,'error'=>'Device ID required'],422);if(!in_array($state,['READY','IN_CALL'],true))$state='READY';
         $q=$p->prepare("UPDATE devices SET last_seen=NOW(),battery_level=COALESCE(:b,battery_level),call_state=:s,state_changed_at=CASE WHEN call_state<>:s2 THEN NOW() ELSE state_changed_at END,call_started_at=CASE WHEN :s3='IN_CALL' AND call_state<>'IN_CALL' THEN NOW() WHEN :s4<>'IN_CALL' THEN NULL ELSE call_started_at END WHERE device_id=:d AND active=1");$q->execute(['b'=>$battery,'s'=>$state,'s2'=>$state,'s3'=>$state,'s4'=>$state,'d'=>$device]);
         if($q->rowCount()===0){$x=$p->prepare('SELECT id FROM devices WHERE device_id=:d AND active=1');$x->execute(['d'=>$device]);if(!$x->fetchColumn())out(['ok'=>false,'joined'=>false,'error'=>'Device is not registered on the server'],404);}
-        out(['ok'=>true,'joined'=>true,'server_time'=>gmdate('c')]);
+        $x=$p->prepare('SELECT employee_id FROM devices WHERE device_id=:d AND active=1 LIMIT 1');$x->execute(['d'=>$device]);$employeeId=(int)$x->fetchColumn();
+    try { autoIdleWarning($p,$employeeId,$device,$state); } catch(Throwable $e) { error_log('AUTO IDLE WARNING ERROR: '.$e->getMessage()); }
+    out(['ok'=>true,'joined'=>true,'server_time'=>gmdate('c')]);
     }
 
     if($path==='/api/employee/calls/sync' && $method==='POST'){
@@ -517,7 +293,30 @@ try {
         $q=$p->prepare("INSERT INTO warning_commands(employee_id,device_id,command_type,message) VALUES(:e,:d,'IDLE_WARNING',:m)");$q->execute(['e'=>$id,'d'=>$e['device_id'],'m'=>mb_substr($msg,0,255)]);audit('WARN_EMPLOYEE',['employee_id'=>$id]);out(['ok'=>true,'queued'=>true]);
     }
     if($path==='/api/employee/commands' && $method==='GET'){
-        $device=trim((string)($_GET['device_id']??''));if(!$device)out(['error'=>'Device ID required'],422);$q=$p->prepare('SELECT id,command_type,message,created_at FROM warning_commands WHERE device_id=:d AND delivered_at IS NULL ORDER BY id LIMIT 5');$q->execute(['d'=>$device]);$c=$q->fetchAll();if($c){$ids=implode(',',array_map('intval',array_column($c,'id')));$p->exec("UPDATE warning_commands SET delivered_at=NOW() WHERE id IN($ids)");}out(['commands'=>$c]);
+        $device=trim((string)($_GET['device_id']??''));
+        if(!$device)out(['error'=>'Device ID required'],422);
+        // Deliver warnings strictly one at a time. A second warning must wait until
+        // the employee acknowledges the first, preventing duplicate/rapid overlay
+        // creation and lost commands when several warnings are queued together.
+        $q=$p->prepare("SELECT id,command_type,message,created_at
+            FROM warning_commands
+            WHERE device_id=:d
+              AND acknowledged_at IS NULL
+              AND NOT EXISTS (
+                  SELECT 1 FROM warning_commands w2
+                  WHERE w2.device_id=:d2
+                    AND w2.acknowledged_at IS NULL
+                    AND w2.id < warning_commands.id
+              )
+            ORDER BY id
+            LIMIT 1");
+        $q->execute(['d'=>$device,'d2'=>$device]);
+        $c=$q->fetchAll();
+        if($c){
+            $q=$p->prepare('UPDATE warning_commands SET delivered_at=NOW() WHERE id=:id AND delivered_at IS NULL');
+            $q->execute(['id'=>(int)$c[0]['id']]);
+        }
+        out(['commands'=>$c]);
     }
     if($path==='/api/employee/command-ack' && $method==='POST'){ $b=body();$q=$p->prepare('UPDATE warning_commands SET acknowledged_at=NOW() WHERE id=:i AND device_id=:d');$q->execute(['i'=>(int)($b['command_id']??0),'d'=>trim((string)($b['device_id']??''))]);out(['ok'=>true]); }
 
