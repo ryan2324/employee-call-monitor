@@ -38,16 +38,108 @@ function ensureSettingsTable(PDO $p): void {
 }
 function autoIdleWarning(PDO $p,int $employeeId,string $deviceId,string $state): void {
     if($state!=='READY' || !$employeeId || !$deviceId) return;
+
     ensureSettingsTable($p);
-    $q=$p->prepare("SELECT setting_value FROM app_settings WHERE setting_key='auto_idle_warning_minutes' LIMIT 1"); $q->execute();
-    $minutes=max(0,min(240,(int)$q->fetchColumn())); if($minutes<=0) return;
-    $q=$p->prepare("SELECT state_changed_at FROM devices WHERE device_id=:d AND active=1 LIMIT 1"); $q->execute(['d'=>$deviceId]); $changed=$q->fetchColumn();
-    if(!$changed) return; $changedTs=strtotime((string)$changed.' UTC');
-    if($changedTs===false || time()-$changedTs < $minutes*60) return;
-    $q=$p->prepare("SELECT id FROM warning_commands WHERE device_id=:d AND command_type='AUTO_IDLE_WARNING' AND created_at >= :changed LIMIT 1");
-    $q->execute(['d'=>$deviceId,'changed'=>date('Y-m-d H:i:s',$changedTs)]); if($q->fetchColumn()) return;
+
+    // Get the automatic idle-warning timer.
+    $q=$p->prepare("
+        SELECT setting_value
+        FROM app_settings
+        WHERE setting_key='auto_idle_warning_minutes'
+        LIMIT 1
+    ");
+    $q->execute();
+
+    $minutes=max(0,min(240,(int)$q->fetchColumn()));
+
+    if($minutes<=0) return;
+
+    /*
+     * Get the current idle-period start.
+     *
+     * state_changed_at is reset whenever the employee:
+     * 1. starts a call,
+     * 2. returns from a call, or
+     * 3. acknowledges an automatic idle warning.
+     */
+    $q=$p->prepare("
+        SELECT state_changed_at
+        FROM devices
+        WHERE device_id=:d
+          AND employee_id=:e
+          AND active=1
+        LIMIT 1
+    ");
+    $q->execute([
+        'd'=>$deviceId,
+        'e'=>$employeeId
+    ]);
+
+    $changed=$q->fetchColumn();
+
+    if(!$changed) return;
+
+    $changedTs=strtotime((string)$changed.' UTC');
+
+    if($changedTs===false) return;
+
+    /*
+     * Do not warn until the COMPLETE idle timer has elapsed.
+     */
+    if(time()-$changedTs < $minutes*60) return;
+
+    /*
+     * IMPORTANT:
+     *
+     * Only one unacknowledged automatic warning is allowed.
+     *
+     * Once it has been acknowledged, it no longer blocks the
+     * next idle cycle. The acknowledgement handler below resets
+     * state_changed_at, so the timer starts from zero again.
+     */
+    $q=$p->prepare("
+        SELECT id
+        FROM warning_commands
+        WHERE device_id=:d
+          AND command_type='AUTO_IDLE_WARNING'
+          AND acknowledged_at IS NULL
+        ORDER BY id DESC
+        LIMIT 1
+    ");
+    $q->execute([
+        'd'=>$deviceId
+    ]);
+
+    if($q->fetchColumn()){
+        // There is already an active/unacknowledged warning.
+        return;
+    }
+
+    /*
+     * Create exactly ONE warning for this idle cycle.
+     */
     $msg='You have been idle for '.$minutes.' minute'.($minutes===1?'':'s').'. Please resume calling now.';
-    $q=$p->prepare("INSERT INTO warning_commands(employee_id,device_id,command_type,message) VALUES(:e,:d,'AUTO_IDLE_WARNING',:m)"); $q->execute(['e'=>$employeeId,'d'=>$deviceId,'m'=>$msg]);
+
+    $q=$p->prepare("
+        INSERT INTO warning_commands(
+            employee_id,
+            device_id,
+            command_type,
+            message
+        )
+        VALUES(
+            :e,
+            :d,
+            'AUTO_IDLE_WARNING',
+            :m
+        )
+    ");
+
+    $q->execute([
+        'e'=>$employeeId,
+        'd'=>$deviceId,
+        'm'=>$msg
+    ]);
 }
 
 function db(): PDO {
