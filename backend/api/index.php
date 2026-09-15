@@ -38,7 +38,6 @@ function ensureSettingsTable(PDO $p): void {
 }
 function autoIdleWarning(PDO $p,int $employeeId,string $deviceId,string $state):void{
     if($state!=='READY'||!$employeeId||!$deviceId)return;
-    ensureSettingsTable($p);
     $q=$p->prepare("SELECT setting_value FROM app_settings WHERE setting_key='auto_idle_warning_minutes' LIMIT 1");$q->execute();
     $minutes=max(0,min(240,(int)$q->fetchColumn()));if($minutes<=0)return;
     $p->beginTransaction();
@@ -124,11 +123,6 @@ $method=$_SERVER['REQUEST_METHOD']??'GET';
 try {
     // Connect lazily so the health endpoint can report database errors instead of returning a blank/500 response.
     $p = db();
-    // Neon/PgBouncer may hand PHP a connection whose previous server-side
-    // transaction ended in an error. Clear any such failed transaction state
-    // before the first statement in this request. ROLLBACK is harmless when
-    // no transaction is active.
-    try { $p->exec('ROLLBACK'); } catch (Throwable $ignored) {}
     if(($path==='/api' || $path==='/api/' || $path==='/api/index.php' || $path==='/api/health') && $method==='GET'){
         try{$p->query('SELECT 1');$tables=[];foreach(['managers','employees','devices','call_history','daily_employee_stats'] as $t){$q=$p->prepare("SELECT COUNT(*) FROM information_schema.tables WHERE table_schema=current_schema() AND table_name=:t");$q->execute(['t'=>$t]);$tables[$t]=((int)$q->fetchColumn()>0);}
             out(['ok'=>true,'service'=>'employee-call-monitor-api','database'=>true,'tables'=>$tables,'php'=>PHP_VERSION,'api_base'=>$config['api_base_url'],'server_time'=>gmdate('c')]);
@@ -331,7 +325,12 @@ try {
         $b=body();$device=trim((string)($b['device_id']??''));if(!$device)out(['ok'=>false,'error'=>'Device ID required'],422);
         $q=$p->prepare('SELECT employee_id,call_state FROM devices WHERE device_id=:d AND active=1 LIMIT 1');$q->execute(['d'=>$device]);$r=$q->fetch();
         if(!$r)out(['ok'=>false,'joined'=>false,'error'=>'Device is not registered on the server'],404);
-        try{autoIdleWarning($p,(int)$r['employee_id'],$device,(string)$r['call_state']);}catch(Throwable $e){error_log('AUTO IDLE WARNING ERROR: '.$e->getMessage());}
+        try{
+            autoIdleWarning($p,(int)$r['employee_id'],$device,(string)$r['call_state']);
+        }catch(Throwable $e){
+            $info=$e instanceof PDOException ? $e->errorInfo : null;
+            error_log('AUTO IDLE WARNING ERROR: '.get_class($e).' | '.$e->getMessage().' | sqlstate='.($info[0]??'').' | detail='.($info[2]??''));
+        }
         out(['ok'=>true,'joined'=>true,'server_time'=>gmdate('c')]);
     }
 
