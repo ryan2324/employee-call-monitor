@@ -600,12 +600,12 @@ try {
             if($type===false)out(['ok'=>false,'error'=>'Warning command not found'],404);
 
             if($type==='AUTO_IDLE_WARNING' || $type==='IDLE_WARNING'){
-                // Clear any remaining automatic warning for this same idle period and
-                // restart the idle clock. Each statement is autocommit and independent.
-                if($type==='AUTO_IDLE_WARNING'){
-                    $q=$p->prepare("UPDATE warning_commands SET acknowledged_at=NOW() WHERE device_id=:d AND command_type='AUTO_IDLE_WARNING' AND acknowledged_at IS NULL");
-                    $q->execute(['d'=>$device]);
-                }
+                // Acknowledging ANY idle warning completes the current idle-warning
+                // cycle. Clear any other automatic warning already queued for this
+                // same idle period, then restart the idle clock. This prevents a
+                // second warning from appearing immediately after acknowledgement.
+                $q=$p->prepare("UPDATE warning_commands SET acknowledged_at=NOW() WHERE device_id=:d AND command_type='AUTO_IDLE_WARNING' AND acknowledged_at IS NULL");
+                $q->execute(['d'=>$device]);
                 $q=$p->prepare("UPDATE devices SET state_changed_at=NOW() WHERE device_id=:d AND active=1 AND call_state='READY'");
                 $q->execute(['d'=>$device]);
             }
