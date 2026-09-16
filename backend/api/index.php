@@ -150,7 +150,10 @@ function addIdleInterval(PDO $p,int $employeeId,?string $lastSeen,?string $state
         $maxGap=$now->modify('-'.(int)$config['app']['heartbeat_timeout_seconds'].' seconds');
         if($fromSeen<$maxGap)$fromSeen=$maxGap;
     }catch(Throwable $e){return;}
-    $idleStart=$changed->modify('+'.$threshold.' seconds');
+    // Idle time is the COMPLETE READY period. The automatic-warning threshold
+    // is intentionally NOT subtracted here; it only controls when a warning is sent.
+    // Use the most recent heartbeat as the start when it is later than the state change.
+    $idleStart=$changed;
     if($fromSeen>$idleStart)$idleStart=$fromSeen;
     if($now<=$idleStart)return;
 
@@ -463,8 +466,8 @@ try {
         if($date===$today){
             foreach($rows as &$r){
                 if(($r['call_state']??'')==='READY' && !empty($r['last_seen']) && !empty($r['state_changed_at'])){
-                    $q2=$p->prepare("SELECT GREATEST(0,EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - GREATEST(last_seen,state_changed_at + (:th * INTERVAL '1 second'))))) FROM devices WHERE device_id=:d AND active=1 AND last_seen >= (NOW() AT TIME ZONE 'UTC') - (:timeout * INTERVAL '1 second')");
-                    $q2->execute(['th'=>(int)$config['app']['idle_threshold_seconds'],'timeout'=>(int)$config['app']['heartbeat_timeout_seconds'],'d'=>$r['device_id']]);$live=$q2->fetchColumn();
+                    $q2=$p->prepare("SELECT GREATEST(0,EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - GREATEST(last_seen,state_changed_at)))) FROM devices WHERE device_id=:d AND active=1 AND last_seen >= (NOW() AT TIME ZONE 'UTC') - (:timeout * INTERVAL '1 second')");
+                    $q2->execute(['timeout'=>(int)$config['app']['heartbeat_timeout_seconds'],'d'=>$r['device_id']]);$live=$q2->fetchColumn();
                     $r['idle_seconds_today']=(int)$r['idle_seconds_today']+(int)max(0,(float)$live);
                 }
                 $r['computed_status']=statusFor($r);
@@ -478,7 +481,7 @@ try {
         $q=$p->prepare("SELECT e.id,e.name,e.department,e.active,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=:d WHERE e.id=:id LIMIT 1");$q->execute(['id'=>$id,'d'=>$date]);$e=$q->fetch();if(!$e)out(['error'=>'Employee not found'],404);$e['computed_status']=statusFor($e);
         $q=$p->prepare("SELECT id,contact_number,result,direction,started_at,ended_at,duration_seconds FROM call_history WHERE employee_id=:id AND started_at>=:fromDate AND started_at<:toDate ORDER BY started_at DESC LIMIT 100");$nextDate=(new DateTimeImmutable($date,new DateTimeZone('Asia/Manila')))->modify('+1 day')->format('Y-m-d');$q->execute(['id'=>$id,'fromDate'=>$date.' 00:00:00','toDate'=>$nextDate.' 00:00:00']);$e['recent_calls']=$q->fetchAll();
         if($date===validDateParam(null) && ($e['call_state']??'')==='READY' && !empty($e['last_seen']) && !empty($e['state_changed_at'])){
-            $q2=$p->prepare("SELECT GREATEST(0,EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - GREATEST(last_seen,state_changed_at + (:th * INTERVAL '1 second'))))) FROM devices WHERE device_id=:d AND active=1 AND last_seen >= (NOW() AT TIME ZONE 'UTC') - (:timeout * INTERVAL '1 second')");$q2->execute(['th'=>(int)$config['app']['idle_threshold_seconds'],'timeout'=>(int)$config['app']['heartbeat_timeout_seconds'],'d'=>$e['device_id']]);$e['idle_seconds_today']=(int)$e['idle_seconds_today']+(int)max(0,(float)$q2->fetchColumn());
+            $q2=$p->prepare("SELECT GREATEST(0,EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - GREATEST(last_seen,state_changed_at)))) FROM devices WHERE device_id=:d AND active=1 AND last_seen >= (NOW() AT TIME ZONE 'UTC') - (:timeout * INTERVAL '1 second')");$q2->execute(['timeout'=>(int)$config['app']['heartbeat_timeout_seconds'],'d'=>$e['device_id']]);$e['idle_seconds_today']=(int)$e['idle_seconds_today']+(int)max(0,(float)$q2->fetchColumn());
         }
         out(['employee'=>$e,'date'=>$date]);
     }
