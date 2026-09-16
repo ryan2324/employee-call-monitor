@@ -541,7 +541,7 @@ try {
         // employee had already exceeded the automatic-warning threshold, the next
         // 5-second idle-check could immediately create AUTO_IDLE_WARNING after the
         // manual warning is acknowledged.
-        $q=$p->prepare("UPDATE devices SET state_changed_at=NOW() WHERE device_id=:d AND active=1 AND call_state='READY'");$q->execute(['d'=>$e['device_id']]);
+        $q=$p->prepare("UPDATE devices SET last_seen=NOW(), state_changed_at=NOW() WHERE device_id=:d AND active=1 AND call_state='READY'");$q->execute(['d'=>$e['device_id']]);
         audit('WARN_EMPLOYEE',['employee_id'=>$id]);out(['ok'=>true,'queued'=>true]);
     }
     if($path==='/api/employee/commands' && $method==='GET'){
@@ -567,6 +567,12 @@ try {
         if($c){
             $q=$p->prepare('UPDATE warning_commands SET delivered_at=NOW() WHERE id=:id AND delivered_at IS NULL');
             $q->execute(['id'=>(int)$c[0]['id']]);
+            // Warning delivery is part of the live employee session. Refresh
+            // last_seen so presenting a warning can never make a healthy phone
+            // appear OFFLINE on the manager dashboard if Android momentarily
+            // pauses the heartbeat while the warning UI is being shown.
+            $q=$p->prepare('UPDATE devices SET last_seen=NOW() WHERE device_id=:d AND active=1');
+            $q->execute(['d'=>$device]);
         }
         out(['commands'=>$c]);
     }
