@@ -129,6 +129,55 @@ function updateDailyStats(PDO $p,int $employeeId,string $date,int $duration,stri
     $sql='INSERT INTO daily_employee_stats('.implode(',',$cols).') VALUES('.implode(',',$vals).') ON CONFLICT (employee_id,stat_date) DO UPDATE SET '.implode(',',$updates);
     $p->prepare($sql)->execute(['e'=>$employeeId,'d'=>$date,'s'=>$success,'f'=>$fail,'dur'=>$duration]);
 }
+function validDateParam(?string $value, ?string $default=null):string{
+    $value=trim((string)$value);
+    if($value!=='' && preg_match('/^\d{4}-\d{2}-\d{2}$/',$value)){
+        $dt=DateTimeImmutable::createFromFormat('!Y-m-d',$value,new DateTimeZone('Asia/Manila'));
+        if($dt && $dt->format('Y-m-d')===$value)return $value;
+    }
+    return $default ?? (new DateTimeImmutable('now',new DateTimeZone('Asia/Manila')))->format('Y-m-d');
+}
+function addIdleInterval(PDO $p,int $employeeId,?string $lastSeen,?string $stateChanged,int $threshold):void{
+    if(!$employeeId||!$lastSeen||!$stateChanged)return;
+    $utc=new DateTimeZone('UTC');
+    try{
+        $fromSeen=new DateTimeImmutable((string)$lastSeen,$utc);
+        $changed=new DateTimeImmutable((string)$stateChanged,$utc);
+        $now=new DateTimeImmutable('now',$utc);
+        // Do not count time while the phone was offline. Only the most recent
+        // heartbeat interval can be attributed to the READY/idle period.
+        global $config;
+        $maxGap=$now->modify('-'.(int)$config['app']['heartbeat_timeout_seconds'].' seconds');
+        if($fromSeen<$maxGap)$fromSeen=$maxGap;
+    }catch(Throwable $e){return;}
+    $idleStart=$changed->modify('+'.$threshold.' seconds');
+    if($fromSeen>$idleStart)$idleStart=$fromSeen;
+    if($now<=$idleStart)return;
+
+    // Split at local midnight so the daily report remains correct when a heartbeat
+    // crosses midnight in the app timezone.
+    $tz=new DateTimeZone('Asia/Manila');
+    $cursor=$idleStart;
+    while($cursor<$now){
+        $local=$cursor->setTimezone($tz);
+        $nextLocalMidnight=$local->setTime(0,0,0)->modify('+1 day');
+        $segmentEnd=min($now->getTimestamp(),$nextLocalMidnight->setTimezone($utc)->getTimestamp());
+        $seconds=max(0,$segmentEnd-$cursor->getTimestamp());
+        if($seconds>0){
+            updateIdleStats($p,$employeeId,$local->format('Y-m-d'),$seconds);
+            $cursor=$cursor->setTimestamp($segmentEnd);
+        }else break;
+    }
+}
+function updateIdleStats(PDO $p,int $employeeId,string $date,int $seconds):void{
+    if($seconds<=0)return;
+    $q=$p->prepare("INSERT INTO daily_employee_stats(employee_id,stat_date,idle_seconds_today) VALUES(:e,:d,:s) ON CONFLICT(employee_id,stat_date) DO UPDATE SET idle_seconds_today=daily_employee_stats.idle_seconds_today+EXCLUDED.idle_seconds_today");
+    try{$q->execute(['e'=>$employeeId,'d'=>$date,'s'=>$seconds]);}catch(Throwable $e){
+        // Older installations may not yet have the idle column. Keep the heartbeat
+        // alive rather than breaking monitoring for the rest of the request.
+        error_log('IDLE STATS UPDATE ERROR: '.$e->getMessage());
+    }
+}
 
 
 $uri=parse_url($_SERVER['REQUEST_URI']??'/',PHP_URL_PATH) ?: '/';
@@ -352,6 +401,11 @@ try {
     if($path==='/api/employee/heartbeat' && $method==='POST'){
         $b=body();$device=trim((string)($b['device_id']??''));$state=strtoupper(trim((string)($b['call_state']??'READY')));$battery=array_key_exists('battery_level',$b)?max(0,min(100,(int)$b['battery_level'])):null;
         if(!$device)out(['ok'=>false,'error'=>'Device ID required'],422);if(!in_array($state,['READY','IN_CALL'],true))$state='READY';
+        // Accumulate the portion of the previous READY interval that had already
+        // crossed the idle threshold. This creates reliable per-day idle totals.
+        $q=$p->prepare('SELECT employee_id,last_seen,call_state,state_changed_at FROM devices WHERE device_id=:d AND active=1 LIMIT 1');$q->execute(['d'=>$device]);$previous=$q->fetch();
+        if(!$previous)out(['ok'=>false,'joined'=>false,'error'=>'Device is not registered on the server'],404);
+        if(($previous['call_state']??'')==='READY') addIdleInterval($p,(int)$previous['employee_id'],$previous['last_seen']??null,$previous['state_changed_at']??null,(int)$config['app']['idle_threshold_seconds']);
         $q=$p->prepare("UPDATE devices SET last_seen=NOW(),battery_level=COALESCE(:b,battery_level),call_state=:s,state_changed_at=CASE WHEN call_state<>:s2 THEN NOW() ELSE state_changed_at END,call_started_at=CASE WHEN :s3='IN_CALL' AND call_state<>'IN_CALL' THEN NOW() WHEN :s4<>'IN_CALL' THEN NULL ELSE call_started_at END WHERE device_id=:d AND active=1 RETURNING employee_id,state_changed_at");
         $q->execute(['b'=>$battery,'s'=>$state,'s2'=>$state,'s3'=>$state,'s4'=>$state,'d'=>$device]);$r=$q->fetch();
         if(!$r)out(['ok'=>false,'joined'=>false,'error'=>'Device is not registered on the server'],404);
@@ -395,21 +449,38 @@ try {
         $device=trim((string)($_GET['device_id']??''));if(!$device)out(['error'=>'Device ID required'],422);
         $q=$p->prepare("SELECT e.id employee_id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at FROM devices d JOIN employees e ON e.id=d.employee_id WHERE d.device_id=:d AND d.active=1 LIMIT 1");$q->execute(['d'=>$device]);$e=$q->fetch();if(!$e)out(['error'=>'Device is not registered'],404);
         $e['status']=statusFor($e);
-        $successExpr=hasColumn($p,'daily_employee_stats','successful_calls_today')?'COALESCE(SUM(successful_calls_today),0)':'0'; $failExpr=hasColumn($p,'daily_employee_stats','unsuccessful_calls_today')?'COALESCE(SUM(unsuccessful_calls_today),0)':'0'; $q=$p->prepare("SELECT COALESCE(SUM(calls_today),0) total_calls,$successExpr successful_calls,$failExpr unsuccessful_calls,COALESCE(SUM(talk_seconds_today),0) total_duration FROM daily_employee_stats WHERE employee_id=:e AND stat_date=CURRENT_DATE");$q->execute(['e'=>$e['employee_id']]);$stats=$q->fetch()?:[];
+        $date=validDateParam($_GET['date']??null); $successExpr=hasColumn($p,'daily_employee_stats','successful_calls_today')?'COALESCE(SUM(successful_calls_today),0)':'0'; $failExpr=hasColumn($p,'daily_employee_stats','unsuccessful_calls_today')?'COALESCE(SUM(unsuccessful_calls_today),0)':'0'; $q=$p->prepare("SELECT COALESCE(SUM(calls_today),0) total_calls,$successExpr successful_calls,$failExpr unsuccessful_calls,COALESCE(SUM(talk_seconds_today),0) total_duration,COALESCE(SUM(idle_seconds_today),0) idle_seconds FROM daily_employee_stats WHERE employee_id=:e AND stat_date=:d");$q->execute(['e'=>$e['employee_id'],'d'=>$date]);$stats=$q->fetch()?:[];
         $q=$p->prepare("SELECT id,contact_number,result,direction,started_at,ended_at,duration_seconds FROM call_history WHERE employee_id=:e ORDER BY started_at DESC LIMIT 50");$q->execute(['e'=>$e['employee_id']]);$calls=$q->fetchAll();
-        out(['employee'=>$e,'stats'=>['total_calls'=>(int)($stats['total_calls']??0),'successful_calls'=>(int)($stats['successful_calls']??0),'unsuccessful_calls'=>(int)($stats['unsuccessful_calls']??0),'total_duration'=>(int)($stats['total_duration']??0)],'calls'=>$calls,'server_time'=>gmdate('c')]);
+        out(['employee'=>$e,'stats'=>['total_calls'=>(int)($stats['total_calls']??0),'successful_calls'=>(int)($stats['successful_calls']??0),'unsuccessful_calls'=>(int)($stats['unsuccessful_calls']??0),'total_duration'=>(int)($stats['total_duration']??0),'idle_seconds'=>(int)($stats['idle_seconds']??0)],'calls'=>$calls,'date'=>$date,'server_time'=>gmdate('c')]);
     }
 
     if($path==='/api/dashboard' && $method==='GET'){
         manager();
-        $rows=$p->query("SELECT e.id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=CURRENT_DATE WHERE e.active=1 ORDER BY e.name")->fetchAll();
-        foreach($rows as &$r){$r['computed_status']=statusFor($r);}unset($r);out(['employees'=>$rows,'server_time'=>gmdate('c')]);
+        $date=validDateParam($_GET['date']??null);
+        $today=validDateParam(null);
+        $q=$p->prepare("SELECT e.id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=:d WHERE e.active=1 ORDER BY e.name");
+        $q->execute(['d'=>$date]);$rows=$q->fetchAll();
+        if($date===$today){
+            foreach($rows as &$r){
+                if(($r['call_state']??'')==='READY' && !empty($r['last_seen']) && !empty($r['state_changed_at'])){
+                    $q2=$p->prepare("SELECT GREATEST(0,EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - GREATEST(last_seen,state_changed_at + (:th * INTERVAL '1 second'))))) FROM devices WHERE device_id=:d AND active=1 AND last_seen >= (NOW() AT TIME ZONE 'UTC') - (:timeout * INTERVAL '1 second')");
+                    $q2->execute(['th'=>(int)$config['app']['idle_threshold_seconds'],'timeout'=>(int)$config['app']['heartbeat_timeout_seconds'],'d'=>$r['device_id']]);$live=$q2->fetchColumn();
+                    $r['idle_seconds_today']=(int)$r['idle_seconds_today']+(int)max(0,(float)$live);
+                }
+                $r['computed_status']=statusFor($r);
+            }unset($r);
+        }else{foreach($rows as &$r){$r['computed_status']=statusFor($r);}unset($r);}
+        out(['employees'=>$rows,'date'=>$date,'server_time'=>gmdate('c')]);
     }
 
     if($path==='/api/employee/detail' && $method==='GET'){
-        manager();$id=(int)($_GET['id']??0);if(!$id)out(['error'=>'Employee ID required'],422);
-        $q=$p->prepare("SELECT e.id,e.name,e.department,e.active,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=CURRENT_DATE WHERE e.id=:id LIMIT 1");$q->execute(['id'=>$id]);$e=$q->fetch();if(!$e)out(['error'=>'Employee not found'],404);$e['computed_status']=statusFor($e);
-        $q=$p->prepare("SELECT id,contact_number,result,direction,started_at,ended_at,duration_seconds FROM call_history WHERE employee_id=:id ORDER BY started_at DESC LIMIT 100");$q->execute(['id'=>$id]);$e['recent_calls']=$q->fetchAll();out(['employee'=>$e]);
+        manager();$id=(int)($_GET['id']??0);if(!$id)out(['error'=>'Employee ID required'],422);$date=validDateParam($_GET['date']??null);
+        $q=$p->prepare("SELECT e.id,e.name,e.department,e.active,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=:d WHERE e.id=:id LIMIT 1");$q->execute(['id'=>$id,'d'=>$date]);$e=$q->fetch();if(!$e)out(['error'=>'Employee not found'],404);$e['computed_status']=statusFor($e);
+        $q=$p->prepare("SELECT id,contact_number,result,direction,started_at,ended_at,duration_seconds FROM call_history WHERE employee_id=:id AND started_at>=:fromDate AND started_at<:toDate ORDER BY started_at DESC LIMIT 100");$nextDate=(new DateTimeImmutable($date,new DateTimeZone('Asia/Manila')))->modify('+1 day')->format('Y-m-d');$q->execute(['id'=>$id,'fromDate'=>$date.' 00:00:00','toDate'=>$nextDate.' 00:00:00']);$e['recent_calls']=$q->fetchAll();
+        if($date===validDateParam(null) && ($e['call_state']??'')==='READY' && !empty($e['last_seen']) && !empty($e['state_changed_at'])){
+            $q2=$p->prepare("SELECT GREATEST(0,EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - GREATEST(last_seen,state_changed_at + (:th * INTERVAL '1 second'))))) FROM devices WHERE device_id=:d AND active=1 AND last_seen >= (NOW() AT TIME ZONE 'UTC') - (:timeout * INTERVAL '1 second')");$q2->execute(['th'=>(int)$config['app']['idle_threshold_seconds'],'timeout'=>(int)$config['app']['heartbeat_timeout_seconds'],'d'=>$e['device_id']]);$e['idle_seconds_today']=(int)$e['idle_seconds_today']+(int)max(0,(float)$q2->fetchColumn());
+        }
+        out(['employee'=>$e,'date'=>$date]);
     }
 
     if($path==='/api/reports/calls' && $method==='GET'){
