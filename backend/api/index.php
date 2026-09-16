@@ -43,19 +43,28 @@ function autoIdleWarning(PDO $p,int $employeeId,string $deviceId,string $state):
     // Keep the warning check completely autocommit so a failed warning insert
     // cannot poison the PostgreSQL connection with SQLSTATE 25P02.
     ensureSettingsTable($p);
-    $q=$p->prepare("SELECT setting_value FROM app_settings WHERE setting_key='auto_idle_warning_minutes' LIMIT 1");
+    // updated_at is also the automatic-warning timer reset point. Any time the
+    // manager turns the feature off, turns it on, or changes the minute value,
+    // the next warning countdown starts from zero for employees who are already
+    // READY. This does not alter the separate full idle-time statistics.
+    $q=$p->prepare("SELECT setting_value,updated_at FROM app_settings WHERE setting_key='auto_idle_warning_minutes' LIMIT 1");
     $q->execute();
-    $minutes=max(0,min(240,(int)$q->fetchColumn()));
+    $setting=$q->fetch();
+    $minutes=max(0,min(240,(int)($setting['setting_value']??0)));
     if($minutes<=0)return;
+    $warningResetAt=(string)($setting['updated_at']??'');
 
-    // Let PostgreSQL calculate the elapsed time. This avoids PHP/DB timezone
-    // interpretation problems with TIMESTAMP WITHOUT TIME ZONE columns.
+    // Let PostgreSQL calculate the elapsed time. The warning countdown starts at
+    // the later of the READY state start and the most recent setting change.
+    // Therefore saving 0 (off), then later saving 1/5/etc., always starts a new
+    // automatic-warning countdown at 00:00.
     $q=$p->prepare("SELECT call_state,state_changed_at,
-        EXTRACT(EPOCH FROM (NOW() - state_changed_at)) AS idle_seconds
+        EXTRACT(EPOCH FROM (NOW() - GREATEST(state_changed_at,
+            COALESCE(CAST(:reset_at AS TIMESTAMP), state_changed_at)))) AS idle_seconds
         FROM devices
         WHERE device_id=:d AND employee_id=:e AND active=1
         LIMIT 1");
-    $q->execute(['d'=>$deviceId,'e'=>$employeeId]);
+    $q->execute(['reset_at'=>($warningResetAt!==''?$warningResetAt:null),'d'=>$deviceId,'e'=>$employeeId]);
     $r=$q->fetch();
     if(!$r || $r['call_state']!=='READY' || empty($r['state_changed_at']))return;
 
@@ -215,7 +224,13 @@ try {
         manager(); ensureSettingsTable($p); $q=$p->prepare("SELECT setting_value FROM app_settings WHERE setting_key='auto_idle_warning_minutes' LIMIT 1");$q->execute();$minutes=max(0,min(240,(int)$q->fetchColumn()));out(['minutes'=>$minutes]);
     }
     if($path==='/api/settings/auto-idle-warning' && $method==='POST'){
-        manager(); ensureSettingsTable($p); $b=body();$minutes=max(0,min(240,(int)($b['minutes']??0)));$q=$p->prepare("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES('auto_idle_warning_minutes',:v,NOW()) ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW()");$q->execute(['v'=>(string)$minutes]);audit('SET_AUTO_IDLE_WARNING',['minutes'=>$minutes]);out(['ok'=>true,'minutes'=>$minutes]);
+        manager(); ensureSettingsTable($p); $b=body();$minutes=max(0,min(240,(int)($b['minutes']??0)));
+        // Every save is an explicit automatic-warning timer reset. Setting 0 turns
+        // the feature off; setting any positive value starts a fresh countdown.
+        $q=$p->prepare("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES('auto_idle_warning_minutes',:v,NOW()) ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW()");
+        $q->execute(['v'=>(string)$minutes]);
+        audit('SET_AUTO_IDLE_WARNING',['minutes'=>$minutes,'timer_reset'=>true]);
+        out(['ok'=>true,'minutes'=>$minutes,'timer_reset'=>true]);
     }
 
     if($path==='/api/join/token' && $method==='POST'){
