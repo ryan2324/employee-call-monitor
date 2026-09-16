@@ -34,6 +34,7 @@ function ensureSettingsTable(PDO $p): void {
     static $done=false; if($done) return;
     $p->exec("CREATE TABLE IF NOT EXISTS app_settings (setting_key VARCHAR(100) PRIMARY KEY, setting_value VARCHAR(255) NOT NULL, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)");
     $p->exec("INSERT INTO app_settings(setting_key,setting_value) VALUES ('auto_idle_warning_minutes','0') ON CONFLICT (setting_key) DO NOTHING");
+    $p->exec("ALTER TABLE devices ADD COLUMN IF NOT EXISTS auto_idle_warning_enabled SMALLINT NOT NULL DEFAULT 1");
     $done=true;
 }
 function autoIdleWarning(PDO $p,int $employeeId,string $deviceId,string $state):void{
@@ -58,7 +59,7 @@ function autoIdleWarning(PDO $p,int $employeeId,string $deviceId,string $state):
     // the later of the READY state start and the most recent setting change.
     // Therefore saving 0 (off), then later saving 1/5/etc., always starts a new
     // automatic-warning countdown at 00:00.
-    $q=$p->prepare("SELECT call_state,state_changed_at,
+    $q=$p->prepare("SELECT call_state,state_changed_at, auto_idle_warning_enabled,
         EXTRACT(EPOCH FROM (NOW() - GREATEST(state_changed_at,
             COALESCE(CAST(:reset_at AS TIMESTAMP), state_changed_at)))) AS idle_seconds
         FROM devices
@@ -67,6 +68,7 @@ function autoIdleWarning(PDO $p,int $employeeId,string $deviceId,string $state):
     $q->execute(['reset_at'=>($warningResetAt!==''?$warningResetAt:null),'d'=>$deviceId,'e'=>$employeeId]);
     $r=$q->fetch();
     if(!$r || $r['call_state']!=='READY' || empty($r['state_changed_at']))return;
+    if((int)($r['auto_idle_warning_enabled']??1)!==1)return;
 
     $idleSeconds=(float)($r['idle_seconds']??0);
     if($idleSeconds < ($minutes*60))return;
@@ -491,7 +493,7 @@ try {
         manager();
         $date=validDateParam($_GET['date']??null);
         $today=validDateParam(null);
-        $q=$p->prepare("SELECT e.id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=:d WHERE e.active=1 ORDER BY e.name");
+        $q=$p->prepare("SELECT e.id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(d.auto_idle_warning_enabled,1) auto_idle_warning_enabled,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=:d WHERE e.active=1 ORDER BY e.name");
         $q->execute(['d'=>$date]);$rows=$q->fetchAll();
         if($date===$today){
             foreach($rows as &$r){
@@ -508,7 +510,7 @@ try {
 
     if($path==='/api/employee/detail' && $method==='GET'){
         manager();$id=(int)($_GET['id']??0);if(!$id)out(['error'=>'Employee ID required'],422);$date=validDateParam($_GET['date']??null);
-        $q=$p->prepare("SELECT e.id,e.name,e.department,e.active,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=:d WHERE e.id=:id LIMIT 1");$q->execute(['id'=>$id,'d'=>$date]);$e=$q->fetch();if(!$e)out(['error'=>'Employee not found'],404);$e['computed_status']=statusFor($e);
+        $q=$p->prepare("SELECT e.id,e.name,e.department,e.active,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(d.auto_idle_warning_enabled,1) auto_idle_warning_enabled,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=:d WHERE e.id=:id LIMIT 1");$q->execute(['id'=>$id,'d'=>$date]);$e=$q->fetch();if(!$e)out(['error'=>'Employee not found'],404);$e['computed_status']=statusFor($e);
         $q=$p->prepare("SELECT id,contact_number,result,direction,started_at,ended_at,duration_seconds FROM call_history WHERE employee_id=:id AND started_at>=:fromDate AND started_at<:toDate ORDER BY started_at DESC LIMIT 100");$nextDate=(new DateTimeImmutable($date,new DateTimeZone('Asia/Manila')))->modify('+1 day')->format('Y-m-d');$q->execute(['id'=>$id,'fromDate'=>$date.' 00:00:00','toDate'=>$nextDate.' 00:00:00']);$e['recent_calls']=$q->fetchAll();
         if($date===validDateParam(null) && ($e['call_state']??'')==='READY' && !empty($e['last_seen']) && !empty($e['state_changed_at'])){
             $q2=$p->prepare("SELECT GREATEST(0,EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - GREATEST(last_seen,state_changed_at)))) FROM devices WHERE device_id=:d AND active=1 AND last_seen >= (NOW() AT TIME ZONE 'UTC') - (:timeout * INTERVAL '1 second')");$q2->execute(['timeout'=>(int)$config['app']['heartbeat_timeout_seconds'],'d'=>$e['device_id']]);$e['idle_seconds_today']=(int)$e['idle_seconds_today']+(int)max(0,(float)$q2->fetchColumn());
@@ -529,6 +531,15 @@ try {
         manager();$from=$_GET['from']??date('Y-m-d');$to=$_GET['to']??date('Y-m-d');$toEx=date('Y-m-d',strtotime($to.' +1 day'));
         $q=$p->prepare("SELECT e.name,e.department,c.contact_number,c.result,c.direction,c.started_at,c.ended_at,c.duration_seconds FROM call_history c JOIN employees e ON e.id=c.employee_id WHERE c.started_at>=:f AND c.started_at<:t ORDER BY c.started_at DESC");$q->execute(['f'=>$from.' 00:00:00','t'=>$toEx.' 00:00:00']);
         header_remove('Content-Type');header('Content-Type:text/csv; charset=utf-8');header('Content-Disposition:attachment; filename="call-history.csv"');$o=fopen('php://output','w');fputcsv($o,['Employee','Department','Contact Number','Result','Direction','Started','Ended','Duration Seconds']);while($r=$q->fetch())fputcsv($o,$r);fclose($o);exit;
+    }
+
+    if($path==='/api/employee/auto-warning' && $method==='POST'){
+        manager();$b=body();$id=(int)($b['employee_id']??0);$enabled=filter_var($b['enabled']??true,FILTER_VALIDATE_BOOLEAN,FILTER_NULL_ON_FAILURE);if(!$id||$enabled===null)out(['error'=>'Employee ID and enabled value required'],422);
+        $q=$p->prepare('SELECT d.device_id FROM employees e JOIN devices d ON d.employee_id=e.id AND d.active=1 WHERE e.id=:id LIMIT 1');$q->execute(['id'=>$id]);$device=$q->fetchColumn();if(!$device)out(['error'=>'Employee or active device not found'],404);
+        $q=$p->prepare("UPDATE devices SET auto_idle_warning_enabled=:v, state_changed_at=NOW() WHERE device_id=:d AND active=1");$q->execute(['v'=>$enabled?1:0,'d'=>$device]);
+        // Disabling cancels any pending automatic warning for this phone. Manual warnings remain independent.
+        if(!$enabled){$q=$p->prepare("UPDATE warning_commands SET acknowledged_at=COALESCE(acknowledged_at,NOW()) WHERE device_id=:d AND command_type='AUTO_IDLE_WARNING' AND acknowledged_at IS NULL");$q->execute(['d'=>$device]);}
+        audit('SET_EMPLOYEE_AUTO_WARNING',['employee_id'=>$id,'enabled'=>$enabled]);out(['ok'=>true,'employee_id'=>$id,'enabled'=>$enabled,'timer_reset'=>true]);
     }
 
     if($path==='/api/employee/warn' && $method==='POST'){
