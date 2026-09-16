@@ -77,13 +77,28 @@ function autoIdleWarning(PDO $p,int $employeeId,string $deviceId,string $state):
         WHERE device_id=:d AND acknowledged_at IS NULL
         ORDER BY id LIMIT 1");
     $q->execute(['d'=>$deviceId]);
-    if($q->fetchColumn())return;
+    if($q->fetchColumn()){
+        // An employee who has an unacknowledged warning is locked in the current
+        // warning period. Keep the AUTOMATIC warning timer at exactly 0 while the
+        // warning is pending. This does NOT stop idle statistics from accumulating:
+        // heartbeat() records each READY interval independently.
+        $q=$p->prepare("UPDATE devices SET state_changed_at=NOW()
+            WHERE device_id=:d AND employee_id=:e AND active=1 AND call_state='READY'");
+        $q->execute(['d'=>$deviceId,'e'=>$employeeId]);
+        return;
+    }
 
     $msg='You have been idle for '.$minutes.' minute'.($minutes===1?'':'s').'. Please resume calling now.';
     $q=$p->prepare("INSERT INTO warning_commands
         (employee_id,device_id,command_type,message)
         VALUES(:e,:d,'AUTO_IDLE_WARNING',:m)");
     $q->execute(['e'=>$employeeId,'d'=>$deviceId,'m'=>$msg]);
+
+    // Warning is now active: freeze/reset the automatic-warning countdown at 0.
+    // Total READY/idle time continues to be recorded by the heartbeat path.
+    $q=$p->prepare("UPDATE devices SET state_changed_at=NOW()
+        WHERE device_id=:d AND employee_id=:e AND active=1 AND call_state='READY'");
+    $q->execute(['d'=>$deviceId,'e'=>$employeeId]);
 }
 
 function db(): PDO {
