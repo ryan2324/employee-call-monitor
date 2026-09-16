@@ -38,19 +38,43 @@ function ensureSettingsTable(PDO $p): void {
 }
 function autoIdleWarning(PDO $p,int $employeeId,string $deviceId,string $state):void{
     if($state!=='READY'||!$employeeId||!$deviceId)return;
-    $q=$p->prepare("SELECT setting_value FROM app_settings WHERE setting_key='auto_idle_warning_minutes' LIMIT 1");$q->execute();
-    $minutes=max(0,min(240,(int)$q->fetchColumn()));if($minutes<=0)return;
-    $p->beginTransaction();
-    try{
-        $q=$p->prepare("SELECT state_changed_at,call_state FROM devices WHERE device_id=:d AND employee_id=:e AND active=1 FOR UPDATE");$q->execute(['d'=>$deviceId,'e'=>$employeeId]);$r=$q->fetch();
-        if(!$r||$r['call_state']!=='READY'||empty($r['state_changed_at'])){$p->commit();return;}
-        $changedTs=strtotime((string)$r['state_changed_at'].' UTC');
-        if($changedTs===false||time()-$changedTs<($minutes*60)){$p->commit();return;}
-        $q=$p->prepare("SELECT id FROM warning_commands WHERE device_id=:d AND acknowledged_at IS NULL ORDER BY id LIMIT 1");$q->execute(['d'=>$deviceId]);
-        if($q->fetchColumn()){$p->commit();return;}
-        $msg='You have been idle for '.$minutes.' minute'.($minutes===1?'':'s').'. Please resume calling now.';
-        $q=$p->prepare("INSERT INTO warning_commands(employee_id,device_id,command_type,message) VALUES(:e,:d,'AUTO_IDLE_WARNING',:m)");$q->execute(['e'=>$employeeId,'d'=>$deviceId,'m'=>$msg]);$p->commit();
-    }catch(Throwable $e){if($p->inTransaction())$p->rollBack();throw $e;}
+
+    // Read the manager setting. The dashboard stores this in app_settings.
+    // Keep the warning check completely autocommit so a failed warning insert
+    // cannot poison the PostgreSQL connection with SQLSTATE 25P02.
+    ensureSettingsTable($p);
+    $q=$p->prepare("SELECT setting_value FROM app_settings WHERE setting_key='auto_idle_warning_minutes' LIMIT 1");
+    $q->execute();
+    $minutes=max(0,min(240,(int)$q->fetchColumn()));
+    if($minutes<=0)return;
+
+    // Let PostgreSQL calculate the elapsed time. This avoids PHP/DB timezone
+    // interpretation problems with TIMESTAMP WITHOUT TIME ZONE columns.
+    $q=$p->prepare("SELECT call_state,state_changed_at,
+        EXTRACT(EPOCH FROM (NOW() - state_changed_at)) AS idle_seconds
+        FROM devices
+        WHERE device_id=:d AND employee_id=:e AND active=1
+        LIMIT 1");
+    $q->execute(['d'=>$deviceId,'e'=>$employeeId]);
+    $r=$q->fetch();
+    if(!$r || $r['call_state']!=='READY' || empty($r['state_changed_at']))return;
+
+    $idleSeconds=(float)($r['idle_seconds']??0);
+    if($idleSeconds < ($minutes*60))return;
+
+    // Do not stack warnings. An unacknowledged manual or automatic warning
+    // already represents the current warning period.
+    $q=$p->prepare("SELECT id FROM warning_commands
+        WHERE device_id=:d AND acknowledged_at IS NULL
+        ORDER BY id LIMIT 1");
+    $q->execute(['d'=>$deviceId]);
+    if($q->fetchColumn())return;
+
+    $msg='You have been idle for '.$minutes.' minute'.($minutes===1?'':'s').'. Please resume calling now.';
+    $q=$p->prepare("INSERT INTO warning_commands
+        (employee_id,device_id,command_type,message)
+        VALUES(:e,:d,'AUTO_IDLE_WARNING',:m)");
+    $q->execute(['e'=>$employeeId,'d'=>$deviceId,'m'=>$msg]);
 }
 
 function db(): PDO {
@@ -312,6 +336,19 @@ try {
         if(!$r||!(int)$r['active'])out(['joined'=>false,'error'=>'Device is not registered on the server'],404);$r['computed_status']=statusFor($r);out(['joined'=>true,'employee'=>$r]);
     }
 
+    if($path==='/api/employee/disconnect' && $method==='POST'){
+        $b=body();$device=trim((string)($b['device_id']??''));
+        if(!$device)out(['ok'=>false,'error'=>'Device ID required'],422);
+        $q=$p->prepare("UPDATE devices SET active=0,last_seen=NOW(),call_state='OFFLINE',state_changed_at=NOW(),call_started_at=NULL WHERE device_id=:d AND active=1 RETURNING employee_id");
+        $q->execute(['d'=>$device]);
+        $eid=$q->fetchColumn();
+        if($eid===false)out(['ok'=>true,'disconnected'=>false,'message'=>'Device was already disconnected']);
+        // Prevent an old warning from appearing after a deliberate disconnect.
+        $q=$p->prepare("UPDATE warning_commands SET acknowledged_at=COALESCE(acknowledged_at,NOW()) WHERE device_id=:d AND acknowledged_at IS NULL");
+        $q->execute(['d'=>$device]);
+        out(['ok'=>true,'disconnected'=>true,'employee_id'=>(int)$eid]);
+    }
+
     if($path==='/api/employee/heartbeat' && $method==='POST'){
         $b=body();$device=trim((string)($b['device_id']??''));$state=strtoupper(trim((string)($b['call_state']??'READY')));$battery=array_key_exists('battery_level',$b)?max(0,min(100,(int)$b['battery_level'])):null;
         if(!$device)out(['ok'=>false,'error'=>'Device ID required'],422);if(!in_array($state,['READY','IN_CALL'],true))$state='READY';
@@ -330,6 +367,7 @@ try {
         }catch(Throwable $e){
             $info=$e instanceof PDOException ? $e->errorInfo : null;
             error_log('AUTO IDLE WARNING ERROR: '.get_class($e).' | '.$e->getMessage().' | sqlstate='.($info[0]??'').' | detail='.($info[2]??''));
+            out(['ok'=>false,'joined'=>true,'error'=>'Automatic warning check failed','detail'=>'Check the Render server log.'],500);
         }
         out(['ok'=>true,'joined'=>true,'server_time'=>gmdate('c')]);
     }
