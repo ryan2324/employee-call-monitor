@@ -124,7 +124,10 @@ function statusFor(array $d):string{
         ? strtotime((string)$d['state_changed_at'].' UTC')
         : $seen;
 
-    return ($changed!==false && time()-$changed >= (int)$config['app']['idle_threshold_seconds'])
+    // Manager table status is intentionally a 1-minute inactivity threshold.
+    // This keeps READY -> IDLE independent from a longer auto-warning setting.
+    $idleThreshold=60;
+    return ($changed!==false && time()-$changed >= $idleThreshold)
         ? 'IDLE'
         : 'READY';
 }
