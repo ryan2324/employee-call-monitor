@@ -55,40 +55,69 @@ function autoIdleWarning(PDO $p,int $employeeId,string $deviceId,string $state):
     $minutes=max(0,min(240,(int)($settings['auto_idle_warning_minutes']??0)));
     if(!$enabled||$minutes<=0)return;
 
-    // Use a PostgreSQL session advisory lock instead of a PDO transaction here.
-    // This prevents two rapid idle-check requests from creating duplicate warnings
-    // without leaving the connection in PostgreSQL's 25P02 failed-transaction state.
-    $lockKey=substr(hash('sha256',$deviceId),0,16);
-    $locked=false;
-    try{
-        $q=$p->prepare('SELECT pg_advisory_lock(hashtext(:k))');
-        $q->execute(['k'=>$lockKey]);
-        $locked=true;
+    /*
+     * Do NOT use pg_advisory_lock() here.
+     *
+     * The old implementation used a blocking PostgreSQL advisory lock. Under
+     * concurrent idle-check requests this could participate in a PostgreSQL
+     * deadlock (SQLSTATE 40P01). Auto-idle warning creation does not require a
+     * blocking lock: PostgreSQL can atomically prevent duplicate pending
+     * warnings with a partial unique index.
+     *
+     * The warning table/index is created once, then the INSERT uses
+     * ON CONFLICT DO NOTHING. This keeps each statement in autocommit mode and
+     * avoids application-level lock waits.
+     */
+    static $warningIndexReady=false;
 
-        $q=$p->prepare("SELECT state_changed_at,call_state FROM devices WHERE device_id=:d AND employee_id=:e AND active=1 LIMIT 1");
+    try{
+        if(!$warningIndexReady){
+            // Only one pending AUTO_IDLE_WARNING is allowed per device.
+            // This is safe to run repeatedly because the index is idempotent.
+            $p->exec("CREATE UNIQUE INDEX IF NOT EXISTS warning_commands_auto_idle_pending_idx
+                      ON warning_commands (device_id)
+                      WHERE command_type='AUTO_IDLE_WARNING' AND acknowledged_at IS NULL");
+            $warningIndexReady=true;
+        }
+
+        $q=$p->prepare("SELECT state_changed_at,call_state
+                        FROM devices
+                        WHERE device_id=:d AND employee_id=:e AND active=1
+                        LIMIT 1");
         $q->execute(['d'=>$deviceId,'e'=>$employeeId]);
         $r=$q->fetch();
+
         if(!$r||$r['call_state']!=='READY'||empty($r['state_changed_at']))return;
 
         $changedTs=strtotime((string)$r['state_changed_at'].' UTC');
         if($changedTs===false||time()-$changedTs<($minutes*60))return;
 
-        $q=$p->prepare("SELECT id FROM warning_commands WHERE device_id=:d AND acknowledged_at IS NULL ORDER BY id LIMIT 1");
+        // A manual warning is also considered a pending warning, so do not
+        // create an automatic warning while any unacknowledged warning exists.
+        $q=$p->prepare("SELECT 1
+                        FROM warning_commands
+                        WHERE device_id=:d
+                          AND acknowledged_at IS NULL
+                        LIMIT 1");
         $q->execute(['d'=>$deviceId]);
         if($q->fetchColumn())return;
 
         $msg='You have been idle for '.$minutes.' minute'.($minutes===1?'':'s').'. Please resume calling now.';
-        $q=$p->prepare("INSERT INTO warning_commands(employee_id,device_id,command_type,message) VALUES(:e,:d,'AUTO_IDLE_WARNING',:m)");
+
+        /*
+         * The unique partial index makes concurrent requests harmless:
+         * whichever INSERT wins creates the warning; the other receives
+         * ON CONFLICT DO NOTHING instead of waiting on an advisory lock.
+         */
+        $q=$p->prepare("INSERT INTO warning_commands(employee_id,device_id,command_type,message)
+                        VALUES(:e,:d,'AUTO_IDLE_WARNING',:m)
+                        ON CONFLICT DO NOTHING");
         $q->execute(['e'=>$employeeId,'d'=>$deviceId,'m'=>$msg]);
+
     }catch(Throwable $e){
-        // Log the actual failing statement context; do not try to continue a failed transaction.
+        // Auto-idle warning is non-critical. Log the failure but do not allow
+        // it to break the phone's normal heartbeat/idle-check response.
         error_log('AUTO IDLE WARNING DB ERROR: '.get_class($e).' | '.$e->getMessage());
-        throw $e;
-    }finally{
-        if($locked){
-            try{$p->prepare('SELECT pg_advisory_unlock(hashtext(:k))')->execute(['k'=>$lockKey]);}
-            catch(Throwable $unlockError){error_log('AUTO IDLE WARNING UNLOCK ERROR: '.$unlockError->getMessage());}
-        }
     }
 }
 
@@ -124,10 +153,7 @@ function statusFor(array $d):string{
         ? strtotime((string)$d['state_changed_at'].' UTC')
         : $seen;
 
-    // Manager table status is intentionally a 1-minute inactivity threshold.
-    // This keeps READY -> IDLE independent from a longer auto-warning setting.
-    $idleThreshold=60;
-    return ($changed!==false && time()-$changed >= $idleThreshold)
+    return ($changed!==false && time()-$changed >= (int)$config['app']['idle_threshold_seconds'])
         ? 'IDLE'
         : 'READY';
 }
@@ -398,6 +424,8 @@ try {
         try{
             autoIdleWarning($p,(int)$r['employee_id'],$device,(string)$r['call_state']);
         }catch(Throwable $e){
+            // Safety net: idle-check must still succeed even if warning creation
+            // encounters an unexpected database error.
             $info=$e instanceof PDOException ? $e->errorInfo : null;
             error_log('AUTO IDLE WARNING ERROR: '.get_class($e).' | '.$e->getMessage().' | sqlstate='.($info[0]??'').' | detail='.($info[2]??''));
         }
