@@ -192,6 +192,32 @@ try {
     }
     if($path==='/api/auth/logout' && $method==='POST'){audit('LOGOUT');$_SESSION=[];session_destroy();out(['ok'=>true]);}
 
+    if($path==='/api/settings/dashboard' && $method==='GET'){
+        manager(); ensureSettingsTable($p);
+        $q=$p->prepare("SELECT setting_key,setting_value FROM app_settings WHERE setting_key IN ('auto_idle_warning_enabled','auto_idle_warning_minutes','screen_wake_enabled','screen_wake_interval_seconds')");
+        $q->execute(); $settings=[]; foreach($q->fetchAll() as $r)$settings[(string)$r['setting_key']]=(string)$r['setting_value'];
+        out(['auto_idle_warning'=>['enabled'=>((string)($settings['auto_idle_warning_enabled']??'0')==='1'),'minutes'=>max(1,min(240,(int)($settings['auto_idle_warning_minutes']??5)))], 'screen_wake'=>['enabled'=>((string)($settings['screen_wake_enabled']??'0')==='1'),'interval_seconds'=>max(5,min(3600,(int)($settings['screen_wake_interval_seconds']??15)))] ]);
+    }
+    if($path==='/api/settings/dashboard' && $method==='POST'){
+        manager(); ensureSettingsTable($p); $b=body();
+        $ai=is_array($b['auto_idle_warning']??null)?$b['auto_idle_warning']:null;
+        $sw=is_array($b['screen_wake']??null)?$b['screen_wake']:null;
+        if($ai!==null){
+            $enabled=!empty($ai['enabled']); $minutes=max(1,min(240,(int)($ai['minutes']??5)));
+            $q=$p->prepare("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES('auto_idle_warning_enabled',:v,NOW()) ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW()");$q->execute(['v'=>$enabled?'1':'0']);
+            $q=$p->prepare("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES('auto_idle_warning_minutes',:v,NOW()) ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW()");$q->execute(['v'=>(string)$minutes]);
+            audit('SET_AUTO_IDLE_WARNING',['enabled'=>$enabled,'minutes'=>$minutes]);
+        }
+        if($sw!==null){
+            $enabled=!empty($sw['enabled']); $seconds=max(5,min(3600,(int)($sw['interval_seconds']??15)));
+            $q=$p->prepare("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES('screen_wake_enabled',:v,NOW()) ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW()");$q->execute(['v'=>$enabled?'1':'0']);
+            $q=$p->prepare("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES('screen_wake_interval_seconds',:v,NOW()) ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW()");$q->execute(['v'=>(string)$seconds]);
+            audit('SET_SCREEN_WAKE',['enabled'=>$enabled,'interval_seconds'=>$seconds]);
+        }
+        $q=$p->prepare("SELECT setting_key,setting_value FROM app_settings WHERE setting_key IN ('auto_idle_warning_enabled','auto_idle_warning_minutes','screen_wake_enabled','screen_wake_interval_seconds')");$q->execute();$settings=[];foreach($q->fetchAll() as $r)$settings[(string)$r['setting_key']]=(string)$r['setting_value'];
+        out(['ok'=>true,'auto_idle_warning'=>['enabled'=>((string)($settings['auto_idle_warning_enabled']??'0')==='1'),'minutes'=>max(1,min(240,(int)($settings['auto_idle_warning_minutes']??5)))], 'screen_wake'=>['enabled'=>((string)($settings['screen_wake_enabled']??'0')==='1'),'interval_seconds'=>max(5,min(3600,(int)($settings['screen_wake_interval_seconds']??15)))] ]);
+    }
+
     if($path==='/api/settings/auto-idle-warning' && $method==='GET'){
         manager(); ensureSettingsTable($p);
         $q=$p->prepare("SELECT setting_key,setting_value FROM app_settings WHERE setting_key IN ('auto_idle_warning_enabled','auto_idle_warning_minutes')");$q->execute();$settings=[];foreach($q->fetchAll() as $r)$settings[(string)$r['setting_key']]=(string)$r['setting_value'];
