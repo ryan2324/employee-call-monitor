@@ -489,22 +489,46 @@ try {
         out(['employee'=>$e,'stats'=>['total_calls'=>(int)($stats['total_calls']??0),'successful_calls'=>(int)($stats['successful_calls']??0),'unsuccessful_calls'=>(int)($stats['unsuccessful_calls']??0),'total_duration'=>(int)($stats['total_duration']??0),'idle_seconds'=>(int)($stats['idle_seconds']??0)],'calls'=>$calls,'date'=>$date,'server_time'=>gmdate('c')]);
     }
 
+    // Lightweight live-status endpoint. The manager polls this frequently;
+    // keep it to one indexed query and never run one DB query per employee.
+    if($path==='/api/dashboard/status' && $method==='GET'){
+        manager();
+        $q=$p->query("SELECT e.id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at
+            FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1
+            WHERE e.active=1 ORDER BY e.name");
+        $rows=$q->fetchAll();
+        foreach($rows as &$r){
+            $r['computed_status']=statusFor($r);
+            $r['live_idle_seconds']=0;
+            if(($r['call_state']??'')==='READY' && !empty($r['last_seen']) && !empty($r['state_changed_at'])){
+                $seen=strtotime((string)$r['last_seen'].' UTC');
+                $changed=strtotime((string)$r['state_changed_at'].' UTC');
+                if($seen!==false && $changed!==false && time()-$seen <= (int)$config['app']['heartbeat_timeout_seconds']){
+                    $r['live_idle_seconds']=max(0,time()-max($seen,$changed));
+                }
+            }
+        } unset($r);
+        out(['employees'=>$rows,'server_time'=>gmdate('c')]);
+    }
+
     if($path==='/api/dashboard' && $method==='GET'){
         manager();
         $date=validDateParam($_GET['date']??null);
-        $today=validDateParam(null);
         $q=$p->prepare("SELECT e.id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(d.auto_idle_warning_enabled,1) auto_idle_warning_enabled,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=:d WHERE e.active=1 ORDER BY e.name");
         $q->execute(['d'=>$date]);$rows=$q->fetchAll();
+        $today=validDateParam(null);
         if($date===$today){
             foreach($rows as &$r){
-                if(($r['call_state']??'')==='READY' && !empty($r['last_seen']) && !empty($r['state_changed_at'])){
-                    $q2=$p->prepare("SELECT GREATEST(0,EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - GREATEST(last_seen,state_changed_at)))) FROM devices WHERE device_id=:d AND active=1 AND last_seen >= (NOW() AT TIME ZONE 'UTC') - (:timeout * INTERVAL '1 second')");
-                    $q2->execute(['timeout'=>(int)$config['app']['heartbeat_timeout_seconds'],'d'=>$r['device_id']]);$live=$q2->fetchColumn();
-                    $r['idle_seconds_today']=(int)$r['idle_seconds_today']+(int)max(0,(float)$live);
-                }
                 $r['computed_status']=statusFor($r);
-            }unset($r);
-        }else{foreach($rows as &$r){$r['computed_status']=statusFor($r);}unset($r);}
+                if(($r['call_state']??'')==='READY' && !empty($r['last_seen']) && !empty($r['state_changed_at'])){
+                    $seen=strtotime((string)$r['last_seen'].' UTC');
+                    $changed=strtotime((string)$r['state_changed_at'].' UTC');
+                    if($seen!==false && $changed!==false && time()-$seen <= (int)$config['app']['heartbeat_timeout_seconds']){
+                        $r['idle_seconds_today']=(int)$r['idle_seconds_today']+max(0,time()-max($seen,$changed));
+                    }
+                }
+            } unset($r);
+        } else { foreach($rows as &$r){$r['computed_status']=statusFor($r);} unset($r); }
         out(['employees'=>$rows,'date'=>$date,'server_time'=>gmdate('c')]);
     }
 
