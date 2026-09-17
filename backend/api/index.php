@@ -138,6 +138,8 @@ function hasColumn(PDO $p,string $table,string $column): bool {
 function audit(string $action,array $details=[]):void{ try{ $q=db()->prepare('INSERT INTO audit_logs(manager_id,action,details,ip_address) VALUES(:m,:a,:d,:ip)'); $q->execute(['m'=>$_SESSION['manager_id']??null,'a'=>$action,'d'=>$details?json_encode($details):null,'ip'=>$_SERVER['REMOTE_ADDR']??null]); }catch(Throwable $e){} }
 function statusFor(array $d):string{
     global $config;
+    // Employee becomes IDLE one minute after the current state began.
+    $idleThreshold = max(1, (int)($config['app']['idle_threshold_seconds'] ?? 60));
     if(empty($d['last_seen'])) return 'OFFLINE';
 
     // PostgreSQL stores last_seen/state_changed_at as TIMESTAMP WITHOUT TIME ZONE
@@ -147,13 +149,27 @@ function statusFor(array $d):string{
     $seen=strtotime((string)$d['last_seen'].' UTC');
     if($seen===false || time()-$seen>(int)$config['app']['heartbeat_timeout_seconds']) return 'OFFLINE';
 
-    if(($d['call_state']??'READY')==='IN_CALL') return 'IN_CALL';
-
-    $changed=!empty($d['state_changed_at'])
+    /*
+     * IN_CALL is the active calling state. Once the call has been active for
+     * the configured idle threshold, report IDLE so the manager dashboard can
+     * show the employee as idle even if the phone is still marked IN_CALL.
+     *
+     * The threshold is intentionally applied to state_changed_at, which is
+     * updated when the phone changes into IN_CALL.
+     */
+    $callState = ($d['call_state']??'READY');
+    $changed = !empty($d['state_changed_at'])
         ? strtotime((string)$d['state_changed_at'].' UTC')
         : $seen;
 
-    return ($changed!==false && time()-$changed >= (int)$config['app']['idle_threshold_seconds'])
+    if($callState==='IN_CALL'){
+        if($changed!==false && time()-$changed >= $idleThreshold){
+            return 'IDLE';
+        }
+        return 'IN_CALL';
+    }
+
+    return ($changed!==false && time()-$changed >= $idleThreshold)
         ? 'IDLE'
         : 'READY';
 }
