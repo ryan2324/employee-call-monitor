@@ -489,21 +489,6 @@ try {
         out(['employee'=>$e,'stats'=>['total_calls'=>(int)($stats['total_calls']??0),'successful_calls'=>(int)($stats['successful_calls']??0),'unsuccessful_calls'=>(int)($stats['unsuccessful_calls']??0),'total_duration'=>(int)($stats['total_duration']??0),'idle_seconds'=>(int)($stats['idle_seconds']??0)],'calls'=>$calls,'date'=>$date,'server_time'=>gmdate('c')]);
     }
 
-    if($path==='/api/dashboard/status' && $method==='GET'){
-        manager();
-        // Lightweight status-only endpoint for near-real-time dashboard updates.
-        // It intentionally avoids the daily stats/call-history joins so a 1-second
-        // visible-dashboard poll remains cheap even with many employees.
-        $q=$p->query("SELECT e.id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at
-            FROM employees e
-            LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1
-            WHERE e.active=1
-            ORDER BY e.name");
-        $rows=$q->fetchAll();
-        foreach($rows as &$r){$r['computed_status']=statusFor($r);} unset($r);
-        out(['employees'=>$rows,'server_time'=>gmdate('c')]);
-    }
-
     if($path==='/api/dashboard' && $method==='GET'){
         manager();
         $date=validDateParam($_GET['date']??null);
@@ -511,16 +496,11 @@ try {
         $q=$p->prepare("SELECT e.id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(d.auto_idle_warning_enabled,1) auto_idle_warning_enabled,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=:d WHERE e.active=1 ORDER BY e.name");
         $q->execute(['d'=>$date]);$rows=$q->fetchAll();
         if($date===$today){
-            // Calculate live idle seconds in PHP from the already-fetched timestamps.
-            // This removes the previous N+1 database query on every dashboard refresh.
-            $now=time();
             foreach($rows as &$r){
                 if(($r['call_state']??'')==='READY' && !empty($r['last_seen']) && !empty($r['state_changed_at'])){
-                    $seen=strtotime((string)$r['last_seen'].' UTC');
-                    $changed=strtotime((string)$r['state_changed_at'].' UTC');
-                    if($seen!==false && $changed!==false && ($now-$seen)<=((int)$config['app']['heartbeat_timeout_seconds'])){
-                        $r['idle_seconds_today']=(int)$r['idle_seconds_today']+max(0,$now-max($seen,$changed));
-                    }
+                    $q2=$p->prepare("SELECT GREATEST(0,EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - GREATEST(last_seen,state_changed_at)))) FROM devices WHERE device_id=:d AND active=1 AND last_seen >= (NOW() AT TIME ZONE 'UTC') - (:timeout * INTERVAL '1 second')");
+                    $q2->execute(['timeout'=>(int)$config['app']['heartbeat_timeout_seconds'],'d'=>$r['device_id']]);$live=$q2->fetchColumn();
+                    $r['idle_seconds_today']=(int)$r['idle_seconds_today']+(int)max(0,(float)$live);
                 }
                 $r['computed_status']=statusFor($r);
             }unset($r);
@@ -533,11 +513,7 @@ try {
         $q=$p->prepare("SELECT e.id,e.name,e.department,e.active,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(d.auto_idle_warning_enabled,1) auto_idle_warning_enabled,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=:d WHERE e.id=:id LIMIT 1");$q->execute(['id'=>$id,'d'=>$date]);$e=$q->fetch();if(!$e)out(['error'=>'Employee not found'],404);$e['computed_status']=statusFor($e);
         $q=$p->prepare("SELECT id,contact_number,result,direction,started_at,ended_at,duration_seconds FROM call_history WHERE employee_id=:id AND started_at>=:fromDate AND started_at<:toDate ORDER BY started_at DESC LIMIT 100");$nextDate=(new DateTimeImmutable($date,new DateTimeZone('Asia/Manila')))->modify('+1 day')->format('Y-m-d');$q->execute(['id'=>$id,'fromDate'=>$date.' 00:00:00','toDate'=>$nextDate.' 00:00:00']);$e['recent_calls']=$q->fetchAll();
         if($date===validDateParam(null) && ($e['call_state']??'')==='READY' && !empty($e['last_seen']) && !empty($e['state_changed_at'])){
-            $seen=strtotime((string)$e['last_seen'].' UTC');
-            $changed=strtotime((string)$e['state_changed_at'].' UTC');
-            if($seen!==false && $changed!==false && (time()-$seen)<=((int)$config['app']['heartbeat_timeout_seconds'])){
-                $e['idle_seconds_today']=(int)$e['idle_seconds_today']+max(0,time()-max($seen,$changed));
-            }
+            $q2=$p->prepare("SELECT GREATEST(0,EXTRACT(EPOCH FROM ((NOW() AT TIME ZONE 'UTC') - GREATEST(last_seen,state_changed_at)))) FROM devices WHERE device_id=:d AND active=1 AND last_seen >= (NOW() AT TIME ZONE 'UTC') - (:timeout * INTERVAL '1 second')");$q2->execute(['timeout'=>(int)$config['app']['heartbeat_timeout_seconds'],'d'=>$e['device_id']]);$e['idle_seconds_today']=(int)$e['idle_seconds_today']+(int)max(0,(float)$q2->fetchColumn());
         }
         out(['employee'=>$e,'date'=>$date]);
     }
