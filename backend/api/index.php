@@ -33,7 +33,7 @@ function manager(): void { if (empty($_SESSION['manager_id'])) out(['error'=>'Un
 function ensureSettingsTable(PDO $p): void {
     static $done=false; if($done) return;
     $p->exec("CREATE TABLE IF NOT EXISTS app_settings (setting_key VARCHAR(100) PRIMARY KEY, setting_value VARCHAR(255) NOT NULL, updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP)");
-    $p->exec("INSERT INTO app_settings(setting_key,setting_value) VALUES ('auto_idle_warning_minutes','0') ON CONFLICT (setting_key) DO NOTHING");
+    $p->exec("INSERT INTO app_settings(setting_key,setting_value) VALUES ('auto_idle_warning_minutes','5') ON CONFLICT (setting_key) DO NOTHING");
     $p->exec("INSERT INTO app_settings(setting_key,setting_value) VALUES ('auto_idle_warning_enabled','0') ON CONFLICT (setting_key) DO NOTHING");
     $p->exec("INSERT INTO app_settings(setting_key,setting_value) VALUES ('screen_wake_enabled','0') ON CONFLICT (setting_key) DO NOTHING");
     $p->exec("INSERT INTO app_settings(setting_key,setting_value) VALUES ('screen_wake_interval_seconds','15') ON CONFLICT (setting_key) DO NOTHING");
@@ -41,23 +41,70 @@ function ensureSettingsTable(PDO $p): void {
 }
 function autoIdleWarning(PDO $p,int $employeeId,string $deviceId,string $state):void{
     if($state!=='READY'||!$employeeId||!$deviceId)return;
-    $q=$p->prepare("SELECT setting_key,setting_value FROM app_settings WHERE setting_key IN ('auto_idle_warning_enabled','auto_idle_warning_minutes')");$q->execute();
-    $settings=[];foreach($q->fetchAll() as $row){$settings[$row['setting_key']]=$row['setting_value'];}
-    $enabled=((int)($settings['auto_idle_warning_enabled']??0))===1;
-    $minutes=max(1,min(240,(int)($settings['auto_idle_warning_minutes']??0)));if(!$enabled)return;
-    $p->beginTransaction();
+
+    // Never inherit a failed PostgreSQL transaction from an earlier statement.
+    // PostgreSQL rejects all further commands until the transaction is rolled back.
+    if($p->inTransaction()){ try{$p->rollBack();}catch(Throwable $ignored){} }
+
+    // Read settings before taking any lock. The ON/OFF switch is explicit;
+    // minutes is retained when the feature is turned OFF.
+    ensureSettingsTable($p);
+    $q=$p->prepare("SELECT setting_key,setting_value FROM app_settings WHERE setting_key IN ('auto_idle_warning_enabled','auto_idle_warning_minutes')");
+    $q->execute();
+    $settings=[];
+    foreach($q->fetchAll() as $row){$settings[(string)$row['setting_key']] = (string)$row['setting_value'];}
+    $enabled=array_key_exists('auto_idle_warning_enabled',$settings)
+        ? ((string)$settings['auto_idle_warning_enabled']==='1')
+        : ((int)($settings['auto_idle_warning_minutes']??0)>0);
+    $minutes=max(0,min(240,(int)($settings['auto_idle_warning_minutes']??0)));
+    if(!$enabled||$minutes<=0)return;
+
+    // Use a PostgreSQL session advisory lock instead of a PDO transaction here.
+    // This prevents two rapid idle-check requests from creating duplicate warnings
+    // without leaving the connection in PostgreSQL's 25P02 failed-transaction state.
+    $lockKey=substr(hash('sha256',$deviceId),0,16);
+    $locked=false;
     try{
-        $q=$p->prepare("SELECT state_changed_at,call_state FROM devices WHERE device_id=:d AND employee_id=:e AND active=1 FOR UPDATE");$q->execute(['d'=>$deviceId,'e'=>$employeeId]);$r=$q->fetch();
-        if(!$r||$r['call_state']!=='READY'||empty($r['state_changed_at'])){$p->commit();return;}
+        $q=$p->prepare('SELECT pg_advisory_lock(hashtext(:k))');
+        $q->execute(['k'=>$lockKey]);
+        $locked=true;
+
+        $q=$p->prepare("SELECT state_changed_at,call_state FROM devices WHERE device_id=:d AND employee_id=:e AND active=1 LIMIT 1");
+        $q->execute(['d'=>$deviceId,'e'=>$employeeId]);
+        $r=$q->fetch();
+        if(!$r||$r['call_state']!=='READY'||empty($r['state_changed_at']))return;
+
         $changedTs=strtotime((string)$r['state_changed_at'].' UTC');
-        if($changedTs===false||time()-$changedTs<($minutes*60)){$p->commit();return;}
-        $q=$p->prepare("SELECT id FROM warning_commands WHERE device_id=:d AND acknowledged_at IS NULL ORDER BY id LIMIT 1");$q->execute(['d'=>$deviceId]);
-        if($q->fetchColumn()){$p->commit();return;}
+        if($changedTs===false||time()-$changedTs<($minutes*60))return;
+
+        $q=$p->prepare("SELECT id FROM warning_commands WHERE device_id=:d AND acknowledged_at IS NULL ORDER BY id LIMIT 1");
+        $q->execute(['d'=>$deviceId]);
+        if($q->fetchColumn())return;
+
         $msg='You have been idle for '.$minutes.' minute'.($minutes===1?'':'s').'. Please resume calling now.';
-        $q=$p->prepare("INSERT INTO warning_commands(employee_id,device_id,command_type,message) VALUES(:e,:d,'AUTO_IDLE_WARNING',:m)");$q->execute(['e'=>$employeeId,'d'=>$deviceId,'m'=>$msg]);$p->commit();
-    }catch(Throwable $e){if($p->inTransaction())$p->rollBack();throw $e;}
+        $q=$p->prepare("INSERT INTO warning_commands(employee_id,device_id,command_type,message) VALUES(:e,:d,'AUTO_IDLE_WARNING',:m)");
+        $q->execute(['e'=>$employeeId,'d'=>$deviceId,'m'=>$msg]);
+    }catch(Throwable $e){
+        // Log the actual failing statement context; do not try to continue a failed transaction.
+        error_log('AUTO IDLE WARNING DB ERROR: '.get_class($e).' | '.$e->getMessage());
+        throw $e;
+    }finally{
+        if($locked){
+            try{$p->prepare('SELECT pg_advisory_unlock(hashtext(:k))')->execute(['k'=>$lockKey]);}
+            catch(Throwable $unlockError){error_log('AUTO IDLE WARNING UNLOCK ERROR: '.$unlockError->getMessage());}
+        }
+    }
 }
 
+function dbFresh(): PDO {
+    global $config;
+    return new PDO($config['db']['dsn'],$config['db']['user'],$config['db']['password'],[
+        PDO::ATTR_ERRMODE=>PDO::ERRMODE_EXCEPTION,
+        PDO::ATTR_DEFAULT_FETCH_MODE=>PDO::FETCH_ASSOC,
+        PDO::ATTR_EMULATE_PREPARES=>false,
+        PDO::ATTR_PERSISTENT=>false
+    ]);
+}
 function db(): PDO {
     global $config; static $pdo=null; if($pdo instanceof PDO) return $pdo;
     $pdo=new PDO($config['db']['dsn'],$config['db']['user'],$config['db']['password'],[
@@ -75,20 +122,25 @@ function hasColumn(PDO $p,string $table,string $column): bool {
 function audit(string $action,array $details=[]):void{ try{ $q=db()->prepare('INSERT INTO audit_logs(manager_id,action,details,ip_address) VALUES(:m,:a,:d,:ip)'); $q->execute(['m'=>$_SESSION['manager_id']??null,'a'=>$action,'d'=>$details?json_encode($details):null,'ip'=>$_SERVER['REMOTE_ADDR']??null]); }catch(Throwable $e){} }
 function statusFor(array $d):string{
     global $config;
-    if(empty($d['last_seen'])) return 'OFFLINE';
+    if(empty($d['last_seen']) && !isset($d['last_seen_epoch'])) return 'OFFLINE';
 
-    // PostgreSQL stores last_seen/state_changed_at as TIMESTAMP WITHOUT TIME ZONE
-    // in UTC. PHP runs in Asia/Manila, so strtotime() without an explicit
-    // timezone incorrectly interprets these database timestamps as Manila time
-    // and makes an actively heartbeating phone appear offline.
-    $seen=strtotime((string)$d['last_seen'].' UTC');
-    if($seen===false || time()-$seen>(int)$config['app']['heartbeat_timeout_seconds']) return 'OFFLINE';
+    // Prefer a server-computed epoch from PostgreSQL. This avoids PHP timezone
+    // interpretation differences for TIMESTAMP WITHOUT TIME ZONE values.
+    if(isset($d['last_seen_epoch']) && $d['last_seen_epoch']!==null){
+        $seen=(int)$d['last_seen_epoch'];
+    }else{
+        $seen=strtotime((string)$d['last_seen'].' UTC');
+        if($seen===false) return 'OFFLINE';
+    }
+    if(time()-$seen>(int)$config['app']['heartbeat_timeout_seconds']) return 'OFFLINE';
 
     if(($d['call_state']??'READY')==='IN_CALL') return 'IN_CALL';
 
-    $changed=!empty($d['state_changed_at'])
-        ? strtotime((string)$d['state_changed_at'].' UTC')
-        : $seen;
+    if(isset($d['state_changed_epoch']) && $d['state_changed_epoch']!==null){
+        $changed=(int)$d['state_changed_epoch'];
+    }else{
+        $changed=!empty($d['state_changed_at']) ? strtotime((string)$d['state_changed_at'].' UTC') : $seen;
+    }
 
     return ($changed!==false && time()-$changed >= (int)$config['app']['idle_threshold_seconds'])
         ? 'IDLE'
@@ -142,28 +194,24 @@ try {
 
     if($path==='/api/settings/auto-idle-warning' && $method==='GET'){
         manager(); ensureSettingsTable($p);
-        $q=$p->prepare("SELECT setting_key,setting_value FROM app_settings WHERE setting_key IN ('auto_idle_warning_enabled','auto_idle_warning_minutes')");$q->execute();$settings=[];foreach($q->fetchAll() as $row){$settings[$row['setting_key']]=$row['setting_value'];}
-        $enabled=((int)($settings['auto_idle_warning_enabled']??0))===1;$minutes=max(1,min(240,(int)($settings['auto_idle_warning_minutes']??5)));
+        $q=$p->prepare("SELECT setting_key,setting_value FROM app_settings WHERE setting_key IN ('auto_idle_warning_enabled','auto_idle_warning_minutes')");$q->execute();$settings=[];foreach($q->fetchAll() as $r)$settings[(string)$r['setting_key']]=(string)$r['setting_value'];
+        $enabled=((string)($settings['auto_idle_warning_enabled']??'0')==='1');$minutes=max(1,min(240,(int)($settings['auto_idle_warning_minutes']??5)));
         out(['enabled'=>$enabled,'minutes'=>$minutes]);
     }
     if($path==='/api/settings/auto-idle-warning' && $method==='POST'){
-        manager(); ensureSettingsTable($p); $b=body();
-        $enabled=array_key_exists('enabled',$b)?(bool)$b['enabled']:null;
-        $minutes=max(1,min(240,(int)($b['minutes']??5)));
-        if($enabled===null){$q=$p->prepare("SELECT setting_value FROM app_settings WHERE setting_key='auto_idle_warning_enabled' LIMIT 1");$q->execute();$enabled=((int)$q->fetchColumn())===1;}
-        $q=$p->prepare("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES('auto_idle_warning_enabled',:e,NOW()) ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW()");$q->execute(['e'=>$enabled?'1':'0']);
+        manager(); ensureSettingsTable($p); $b=body();$enabled=!empty($b['enabled']);$minutes=max(1,min(240,(int)($b['minutes']??5)));
+        $q=$p->prepare("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES('auto_idle_warning_enabled',:v,NOW()) ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW()");$q->execute(['v'=>$enabled?'1':'0']);
         $q=$p->prepare("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES('auto_idle_warning_minutes',:v,NOW()) ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW()");$q->execute(['v'=>(string)$minutes]);
         audit('SET_AUTO_IDLE_WARNING',['enabled'=>$enabled,'minutes'=>$minutes]);out(['ok'=>true,'enabled'=>$enabled,'minutes'=>$minutes]);
     }
-
     if($path==='/api/settings/screen-wake' && $method==='GET'){
-        manager(); ensureSettingsTable($p); $q=$p->prepare("SELECT setting_key,setting_value FROM app_settings WHERE setting_key IN ('screen_wake_enabled','screen_wake_interval_seconds')");$q->execute();$settings=[];foreach($q->fetchAll() as $row){$settings[$row['setting_key']]=$row['setting_value'];}
-        $enabled=((int)($settings['screen_wake_enabled']??0))===1;$seconds=max(5,min(3600,(int)($settings['screen_wake_interval_seconds']??15)));
+        manager(); ensureSettingsTable($p); $q=$p->prepare("SELECT setting_key,setting_value FROM app_settings WHERE setting_key IN ('screen_wake_enabled','screen_wake_interval_seconds')");$q->execute();$settings=[];foreach($q->fetchAll() as $r)$settings[(string)$r['setting_key']]=(string)$r['setting_value'];
+        $enabled=((string)($settings['screen_wake_enabled']??'0')==='1');$seconds=max(5,min(3600,(int)($settings['screen_wake_interval_seconds']??15)));
         out(['enabled'=>$enabled,'interval_seconds'=>$seconds]);
     }
     if($path==='/api/settings/screen-wake' && $method==='POST'){
-        manager(); ensureSettingsTable($p); $b=body();$enabled=(bool)($b['enabled']??false);$seconds=max(5,min(3600,(int)($b['interval_seconds']??15)));
-        $q=$p->prepare("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES('screen_wake_enabled',:e,NOW()) ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW()");$q->execute(['e'=>$enabled?'1':'0']);
+        manager(); ensureSettingsTable($p); $b=body();$enabled=!empty($b['enabled']);$seconds=max(5,min(3600,(int)($b['interval_seconds']??15)));
+        $q=$p->prepare("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES('screen_wake_enabled',:v,NOW()) ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW()");$q->execute(['v'=>$enabled?'1':'0']);
         $q=$p->prepare("INSERT INTO app_settings(setting_key,setting_value,updated_at) VALUES('screen_wake_interval_seconds',:v,NOW()) ON CONFLICT(setting_key) DO UPDATE SET setting_value=EXCLUDED.setting_value,updated_at=NOW()");$q->execute(['v'=>(string)$seconds]);
         audit('SET_SCREEN_WAKE',['enabled'=>$enabled,'interval_seconds'=>$seconds]);out(['ok'=>true,'enabled'=>$enabled,'interval_seconds'=>$seconds]);
     }
@@ -172,6 +220,17 @@ try {
         manager();$token=bin2hex(random_bytes(16));$exp=time()+(int)$config['app']['join_token_minutes']*60;
         $q=$p->prepare('INSERT INTO join_tokens(token,expires_at,created_by) VALUES(:t,:exp,:m)');$q->execute(['t'=>$token,'exp'=>gmdate('Y-m-d H:i:s',$exp),'m'=>$_SESSION['manager_id']]);audit('CREATE_JOIN_TOKEN');
         out(['token'=>$token,'expires_at'=>gmdate('c',$exp)]);
+    }
+
+    if($path==='/api/employee/screen-wake-config' && $method==='GET'){
+        $device=trim((string)($_GET['device_id']??''));
+        if(!$device)out(['joined'=>false,'error'=>'Device ID required'],422);
+        $q=$p->prepare('SELECT id FROM devices WHERE device_id=:d AND active=1 LIMIT 1');$q->execute(['d'=>$device]);
+        if(!$q->fetchColumn())out(['joined'=>false,'error'=>'Device is not registered on the server'],404);
+        ensureSettingsTable($p);
+        $q=$p->prepare("SELECT setting_key,setting_value FROM app_settings WHERE setting_key IN ('screen_wake_enabled','screen_wake_interval_seconds')");$q->execute();$settings=[];foreach($q->fetchAll() as $r)$settings[(string)$r['setting_key']]=(string)$r['setting_value'];
+        $enabled=((string)($settings['screen_wake_enabled']??'0')==='1');$seconds=max(5,min(3600,(int)($settings['screen_wake_interval_seconds']??15)));
+        out(['joined'=>true,'enabled'=>$enabled,'interval_seconds'=>$seconds]);
     }
 
     if($path==='/api/employee/join' && $method==='POST'){
@@ -269,9 +328,9 @@ try {
                 $step='update device';
                 $p->prepare("UPDATE devices
                     SET model=:model,
-                        last_seen=NOW(),
+                        last_seen=timezone('UTC',CURRENT_TIMESTAMP),
                         call_state='READY',
-                        state_changed_at=NOW(),
+                        state_changed_at=timezone('UTC',CURRENT_TIMESTAMP),
                         active=1
                     WHERE id=:id")
                     ->execute(['model'=>$model?:null,'id'=>$old['id']]);
@@ -288,7 +347,7 @@ try {
                 $q=$p->prepare("INSERT INTO devices(
                     employee_id,device_id,model,last_seen,call_state,state_changed_at
                 ) VALUES(
-                    :e,:d,:m,NOW(),'READY',NOW()
+                    :e,:d,:m,timezone('UTC',CURRENT_TIMESTAMP),'READY',timezone('UTC',CURRENT_TIMESTAMP)
                 )");
                 $q->execute(['e'=>$eid,'d'=>$device,'m'=>$model?:null]);
             }
@@ -334,14 +393,14 @@ try {
 
     if($path==='/api/employee/status' && $method==='GET'){
         $device=trim((string)($_GET['device_id']??''));if(!$device)out(['joined'=>false,'error'=>'Device ID required'],422);
-        $q=$p->prepare('SELECT e.id employee_id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,d.active FROM devices d JOIN employees e ON e.id=d.employee_id WHERE d.device_id=:d LIMIT 1');$q->execute(['d'=>$device]);$r=$q->fetch();
+        $q=$p->prepare("SELECT e.id employee_id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,EXTRACT(EPOCH FROM (d.last_seen AT TIME ZONE 'UTC')) last_seen_epoch,EXTRACT(EPOCH FROM (d.state_changed_at AT TIME ZONE 'UTC')) state_changed_epoch,d.active FROM devices d JOIN employees e ON e.id=d.employee_id WHERE d.device_id=:d LIMIT 1");$q->execute(['d'=>$device]);$r=$q->fetch();
         if(!$r||!(int)$r['active'])out(['joined'=>false,'error'=>'Device is not registered on the server'],404);$r['computed_status']=statusFor($r);out(['joined'=>true,'employee'=>$r]);
     }
 
     if($path==='/api/employee/heartbeat' && $method==='POST'){
         $b=body();$device=trim((string)($b['device_id']??''));$state=strtoupper(trim((string)($b['call_state']??'READY')));$battery=array_key_exists('battery_level',$b)?max(0,min(100,(int)$b['battery_level'])):null;
         if(!$device)out(['ok'=>false,'error'=>'Device ID required'],422);if(!in_array($state,['READY','IN_CALL'],true))$state='READY';
-        $q=$p->prepare("UPDATE devices SET last_seen=NOW(),battery_level=COALESCE(:b,battery_level),call_state=:s,state_changed_at=CASE WHEN call_state<>:s2 THEN NOW() ELSE state_changed_at END,call_started_at=CASE WHEN :s3='IN_CALL' AND call_state<>'IN_CALL' THEN NOW() WHEN :s4<>'IN_CALL' THEN NULL ELSE call_started_at END WHERE device_id=:d AND active=1 RETURNING employee_id,state_changed_at");
+        $q=$p->prepare("UPDATE devices SET last_seen=timezone('UTC',CURRENT_TIMESTAMP),battery_level=COALESCE(:b,battery_level),call_state=:s,state_changed_at=CASE WHEN call_state<>:s2 THEN timezone('UTC',CURRENT_TIMESTAMP) ELSE state_changed_at END,call_started_at=CASE WHEN :s3='IN_CALL' AND call_state<>'IN_CALL' THEN timezone('UTC',CURRENT_TIMESTAMP) WHEN :s4<>'IN_CALL' THEN NULL ELSE call_started_at END WHERE device_id=:d AND active=1 RETURNING employee_id,state_changed_at");
         $q->execute(['b'=>$battery,'s'=>$state,'s2'=>$state,'s3'=>$state,'s4'=>$state,'d'=>$device]);$r=$q->fetch();
         if(!$r)out(['ok'=>false,'joined'=>false,'error'=>'Device is not registered on the server'],404);
         out(['ok'=>true,'joined'=>true,'employee_id'=>(int)$r['employee_id'],'state_changed_at'=>$r['state_changed_at'],'server_time'=>gmdate('c')]);
@@ -352,8 +411,14 @@ try {
         $q=$p->prepare('SELECT employee_id,call_state FROM devices WHERE device_id=:d AND active=1 LIMIT 1');$q->execute(['d'=>$device]);$r=$q->fetch();
         if(!$r)out(['ok'=>false,'joined'=>false,'error'=>'Device is not registered on the server'],404);
         try{
-            autoIdleWarning($p,(int)$r['employee_id'],$device,(string)$r['call_state']);
+            // Use a separate short-lived connection for the warning workflow.
+            // A failed statement elsewhere in the request can leave PostgreSQL's
+            // current transaction aborted (25P02); that must never poison warning checks.
+            $warningDb=dbFresh();
+            autoIdleWarning($warningDb,(int)$r['employee_id'],$device,(string)$r['call_state']);
+            unset($warningDb);
         }catch(Throwable $e){
+            if(isset($warningDb) && $warningDb instanceof PDO && $warningDb->inTransaction()){try{$warningDb->rollBack();}catch(Throwable $ignored){}}
             $info=$e instanceof PDOException ? $e->errorInfo : null;
             error_log('AUTO IDLE WARNING ERROR: '.get_class($e).' | '.$e->getMessage().' | sqlstate='.($info[0]??'').' | detail='.($info[2]??''));
         }
@@ -381,7 +446,7 @@ try {
 
     if($path==='/api/employee/dashboard' && $method==='GET'){
         $device=trim((string)($_GET['device_id']??''));if(!$device)out(['error'=>'Device ID required'],422);
-        $q=$p->prepare("SELECT e.id employee_id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at FROM devices d JOIN employees e ON e.id=d.employee_id WHERE d.device_id=:d AND d.active=1 LIMIT 1");$q->execute(['d'=>$device]);$e=$q->fetch();if(!$e)out(['error'=>'Device is not registered'],404);
+        $q=$p->prepare("SELECT e.id employee_id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,EXTRACT(EPOCH FROM (d.last_seen AT TIME ZONE 'UTC')) last_seen_epoch,EXTRACT(EPOCH FROM (d.state_changed_at AT TIME ZONE 'UTC')) state_changed_epoch FROM devices d JOIN employees e ON e.id=d.employee_id WHERE d.device_id=:d AND d.active=1 LIMIT 1");$q->execute(['d'=>$device]);$e=$q->fetch();if(!$e)out(['error'=>'Device is not registered'],404);
         $e['status']=statusFor($e);
         $successExpr=hasColumn($p,'daily_employee_stats','successful_calls_today')?'COALESCE(SUM(successful_calls_today),0)':'0'; $failExpr=hasColumn($p,'daily_employee_stats','unsuccessful_calls_today')?'COALESCE(SUM(unsuccessful_calls_today),0)':'0'; $q=$p->prepare("SELECT COALESCE(SUM(calls_today),0) total_calls,$successExpr successful_calls,$failExpr unsuccessful_calls,COALESCE(SUM(talk_seconds_today),0) total_duration FROM daily_employee_stats WHERE employee_id=:e AND stat_date=CURRENT_DATE");$q->execute(['e'=>$e['employee_id']]);$stats=$q->fetch()?:[];
         $q=$p->prepare("SELECT id,contact_number,result,direction,started_at,ended_at,duration_seconds FROM call_history WHERE employee_id=:e ORDER BY started_at DESC LIMIT 50");$q->execute(['e'=>$e['employee_id']]);$calls=$q->fetchAll();
@@ -390,14 +455,47 @@ try {
 
     if($path==='/api/dashboard' && $method==='GET'){
         manager();
-        $rows=$p->query("SELECT e.id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=CURRENT_DATE WHERE e.active=1 ORDER BY e.name")->fetchAll();
-        foreach($rows as &$r){$r['computed_status']=statusFor($r);}unset($r);out(['employees'=>$rows,'server_time'=>gmdate('c')]);
+        $selectedDate=(string)($_GET['date']??date('Y-m-d'));
+        if(!preg_match('/^\d{4}-\d{2}-\d{2}$/',$selectedDate)) $selectedDate=date('Y-m-d');
+        $q=$p->query("SELECT e.id,e.name,e.department,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,
+            EXTRACT(EPOCH FROM (d.last_seen AT TIME ZONE 'UTC')) last_seen_epoch,
+            EXTRACT(EPOCH FROM (d.state_changed_at AT TIME ZONE 'UTC')) state_changed_epoch
+            FROM employees e
+            LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1
+            WHERE e.active=1 ORDER BY e.name");
+        $rows=$q->fetchAll();
+
+        // Statistics are queried separately from live device state. A bad/missing
+        // daily-stats row must never make every employee appear offline.
+        try{
+            $sq=$p->prepare("SELECT employee_id,calls_today,successful_calls_today,unsuccessful_calls_today,talk_seconds_today,idle_seconds_today
+                FROM daily_employee_stats WHERE stat_date=:d");
+            $sq->execute(['d'=>$selectedDate]);
+            $stats=[];
+            foreach($sq->fetchAll() as $st){$stats[(int)$st['employee_id']]=$st;}
+        }catch(Throwable $e){
+            error_log('DASHBOARD STATS ERROR: '.$e->getMessage());
+            $stats=[];
+        }
+
+        foreach($rows as &$r){
+            $st=$stats[(int)$r['id']]??[];
+            $r['calls_today']=(int)($st['calls_today']??0);
+            $r['successful_calls_today']=(int)($st['successful_calls_today']??0);
+            $r['unsuccessful_calls_today']=(int)($st['unsuccessful_calls_today']??0);
+            $r['talk_seconds_today']=(int)($st['talk_seconds_today']??0);
+            $r['idle_seconds_today']=(int)($st['idle_seconds_today']??0);
+            $r['computed_status']=statusFor($r);
+        }
+        unset($r);
+        out(['employees'=>$rows,'selected_date'=>$selectedDate,'server_time'=>gmdate('c')]);
     }
 
     if($path==='/api/employee/detail' && $method==='GET'){
-        manager();$id=(int)($_GET['id']??0);if(!$id)out(['error'=>'Employee ID required'],422);
-        $q=$p->prepare("SELECT e.id,e.name,e.department,e.active,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=CURRENT_DATE WHERE e.id=:id LIMIT 1");$q->execute(['id'=>$id]);$e=$q->fetch();if(!$e)out(['error'=>'Employee not found'],404);$e['computed_status']=statusFor($e);
-        $q=$p->prepare("SELECT id,contact_number,result,direction,started_at,ended_at,duration_seconds FROM call_history WHERE employee_id=:id ORDER BY started_at DESC LIMIT 100");$q->execute(['id'=>$id]);$e['recent_calls']=$q->fetchAll();out(['employee'=>$e]);
+        manager();
+        $selectedDate=(string)($_GET['date']??date('Y-m-d')); if(!preg_match('/^\d{4}-\d{2}-\d{2}$/',$selectedDate)) $selectedDate=date('Y-m-d');$id=(int)($_GET['id']??0);if(!$id)out(['error'=>'Employee ID required'],422);
+        $q=$p->prepare("SELECT e.id,e.name,e.department,e.active,d.device_id,d.model,d.battery_level,d.last_seen,d.call_state,d.state_changed_at,COALESCE(s.calls_today,0) calls_today,COALESCE(s.successful_calls_today,0) successful_calls_today,COALESCE(s.unsuccessful_calls_today,0) unsuccessful_calls_today,COALESCE(s.talk_seconds_today,0) talk_seconds_today,COALESCE(s.idle_seconds_today,0) idle_seconds_today FROM employees e LEFT JOIN devices d ON d.employee_id=e.id AND d.active=1 LEFT JOIN daily_employee_stats s ON s.employee_id=e.id AND s.stat_date=:sd WHERE e.id=:id LIMIT 1");$q->execute(['id'=>$id,'sd'=>$selectedDate]);$e=$q->fetch();if(!$e)out(['error'=>'Employee not found'],404);$e['computed_status']=statusFor($e);
+        $q=$p->prepare("SELECT id,contact_number,result,direction,started_at,ended_at,duration_seconds FROM call_history WHERE employee_id=:id AND started_at>=:f AND started_at<:t ORDER BY started_at DESC LIMIT 100");$q->execute(['id'=>$id,'f'=>$selectedDate.' 00:00:00','t'=>date('Y-m-d',strtotime($selectedDate.' +1 day')).' 00:00:00']);$e['recent_calls']=$q->fetchAll();out(['employee'=>$e,'selected_date'=>$selectedDate]);
     }
 
     if($path==='/api/reports/calls' && $method==='GET'){
@@ -425,15 +523,9 @@ try {
         // employee had already exceeded the automatic-warning threshold, the next
         // 5-second idle-check could immediately create AUTO_IDLE_WARNING after the
         // manual warning is acknowledged.
-        $q=$p->prepare("UPDATE devices SET state_changed_at=NOW() WHERE device_id=:d AND active=1 AND call_state='READY'");$q->execute(['d'=>$e['device_id']]);
+        $q=$p->prepare("UPDATE devices SET state_changed_at=timezone('UTC',CURRENT_TIMESTAMP) WHERE device_id=:d AND active=1 AND call_state='READY'");$q->execute(['d'=>$e['device_id']]);
         audit('WARN_EMPLOYEE',['employee_id'=>$id]);out(['ok'=>true,'queued'=>true]);
     }
-    if($path==='/api/employee/control' && $method==='GET'){
-        $device=trim((string)($_GET['device_id']??''));if(!$device)out(['error'=>'Device ID required'],422);
-        ensureSettingsTable($p);$q=$p->prepare("SELECT setting_key,setting_value FROM app_settings WHERE setting_key IN ('screen_wake_enabled','screen_wake_interval_seconds','auto_idle_warning_enabled','auto_idle_warning_minutes')");$q->execute();$settings=[];foreach($q->fetchAll() as $row){$settings[$row['setting_key']]=$row['setting_value'];}
-        out(['screen_wake'=>['enabled'=>((int)($settings['screen_wake_enabled']??0))===1,'interval_seconds'=>max(5,min(3600,(int)($settings['screen_wake_interval_seconds']??15)))],'auto_warning'=>['enabled'=>((int)($settings['auto_idle_warning_enabled']??0))===1,'minutes'=>max(1,min(240,(int)($settings['auto_idle_warning_minutes']??5)))] ,'server_time'=>gmdate('c')]);
-    }
-
     if($path==='/api/employee/commands' && $method==='GET'){
         $device=trim((string)($_GET['device_id']??''));
         if(!$device)out(['error'=>'Device ID required'],422);
@@ -479,7 +571,7 @@ try {
                     $q=$p->prepare("UPDATE warning_commands SET acknowledged_at=NOW() WHERE device_id=:d AND command_type='AUTO_IDLE_WARNING' AND acknowledged_at IS NULL");
                     $q->execute(['d'=>$device]);
                 }
-                $q=$p->prepare("UPDATE devices SET state_changed_at=NOW() WHERE device_id=:d AND active=1 AND call_state='READY'");
+                $q=$p->prepare("UPDATE devices SET state_changed_at=timezone('UTC',CURRENT_TIMESTAMP) WHERE device_id=:d AND active=1 AND call_state='READY'");
                 $q->execute(['d'=>$device]);
             }
             out(['ok'=>true,'reset_idle_timer'=>true,'command_type'=>$type]);
