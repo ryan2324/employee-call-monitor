@@ -4,7 +4,7 @@ $config = require __DIR__ . '/config.php';
 // Allow the manager web app to authenticate against a separate API origin.
 session_name((string)$config['app']['session_name']);
 session_set_cookie_params([
-    'lifetime' => 0,
+    'lifetime' => 0, 
     'path' => '/',
     'secure' => (bool)$config['app']['cookie_secure'],
     'httponly' => true,
