@@ -73,7 +73,7 @@ function autoIdleWarning(PDO $p,int $employeeId,string $deviceId,string $state):
     $msg='You have been idle for '.$minutes.' minute'.($minutes===1?'':'s').'. Please resume calling now.';
 
     try{
-        $q=$p->prepare("INSERT INTO warning_commands(employee_id,device_id,command_type,message,idle_start) VALUES(:e,:d,'AUTO_IDLE_WARNING',:m,:idle_start) ON CONFLICT (device_id,command_type,idle_start) DO NOTHING RETURNING id");
+        $q=$p->prepare("INSERT INTO warning_commands(employee_id,device_id,command_type,message,idle_start) VALUES(:e,:d,'AUTO_IDLE_WARNING',:m,:idle_start) ON CONFLICT DO NOTHING RETURNING id");
         $q->execute(['e'=>$employeeId,'d'=>$deviceId,'m'=>$msg,'idle_start'=>$idleStart]);
         $q->fetchColumn();
     }catch(Throwable $e){
