@@ -42,67 +42,69 @@ function ensureSettingsTable(PDO $p): void {
 function autoIdleWarning(PDO $p,int $employeeId,string $deviceId,string $state):void{
     if($state!=='READY'||!$employeeId||!$deviceId)return;
 
-    // Never inherit a failed PostgreSQL transaction from an earlier statement.
-    // PostgreSQL rejects all further commands until the transaction is rolled back.
+    // This workflow must never inherit a failed transaction.
     if($p->inTransaction()){ try{$p->rollBack();}catch(Throwable $ignored){} }
 
-    // Read settings before taking any lock. The ON/OFF switch is explicit;
-    // minutes is retained when the feature is turned OFF.
     ensureSettingsTable($p);
     $q=$p->prepare("SELECT setting_key,setting_value FROM app_settings WHERE setting_key IN ('auto_idle_warning_enabled','auto_idle_warning_minutes')");
     $q->execute();
     $settings=[];
     foreach($q->fetchAll() as $row){$settings[(string)$row['setting_key']] = (string)$row['setting_value'];}
-    $enabled=array_key_exists('auto_idle_warning_enabled',$settings)
-        ? ((string)$settings['auto_idle_warning_enabled']==='1')
-        : ((int)($settings['auto_idle_warning_minutes']??0)>0);
+    $enabled=((string)($settings['auto_idle_warning_enabled']??'0')==='1');
     $minutes=max(0,min(240,(int)($settings['auto_idle_warning_minutes']??0)));
     if(!$enabled||$minutes<=0)return;
 
-    // Use a PostgreSQL session advisory lock instead of a PDO transaction here.
-    // This prevents two rapid idle-check requests from creating duplicate warnings
-    // without leaving the connection in PostgreSQL's 25P02 failed-transaction state.
+    // IMPORTANT: use a NON-BLOCKING transaction-level advisory lock.
+    // The previous pg_advisory_lock() could wait while another request held
+    // a different advisory lock, producing PostgreSQL 40P01 deadlocks.
+    // If another check is already handling this device, simply skip this run.
     $lockKey=substr(hash('sha256',$deviceId),0,16);
-    $locked=false;
+    $started=false;
     try{
-        $q=$p->prepare('SELECT pg_advisory_lock(hashtext(:k))');
+        $p->beginTransaction();
+        $started=true;
+
+        $q=$p->prepare('SELECT pg_try_advisory_xact_lock(hashtext(:k))');
         $q->execute(['k'=>$lockKey]);
-        $locked=true;
+        if(!(bool)$q->fetchColumn()){
+            $p->rollBack();
+            return;
+        }
 
         $q=$p->prepare("SELECT state_changed_at,call_state FROM devices WHERE device_id=:d AND employee_id=:e AND active=1 LIMIT 1");
         $q->execute(['d'=>$deviceId,'e'=>$employeeId]);
         $r=$q->fetch();
-        if(!$r||$r['call_state']!=='READY'||empty($r['state_changed_at']))return;
+        if(!$r||$r['call_state']!=='READY'||empty($r['state_changed_at'])){
+            $p->rollBack();
+            return;
+        }
 
         $changedTs=strtotime((string)$r['state_changed_at'].' UTC');
-        if($changedTs===false||time()-$changedTs<($minutes*60))return;
+        if($changedTs===false||time()-$changedTs<($minutes*60)){
+            $p->rollBack();
+            return;
+        }
 
-        // A warning is allowed only once during the current idle period.
-        // Acknowledging a warning must NOT reset state_changed_at: the employee
-        // remains IDLE until an actual call starts. The next call changes
-        // state_changed_at and therefore starts a fresh idle period.
-        $q=$p->prepare("SELECT id FROM warning_commands WHERE device_id=:d AND acknowledged_at IS NULL ORDER BY id LIMIT 1");
-        $q->execute(['d'=>$deviceId]);
-        if($q->fetchColumn())return;
+        // One automatic warning per idle period.
+        // Acknowledging the warning never changes state_changed_at.
+        // A real call changes call_state and starts a new idle period later.
         $q=$p->prepare("SELECT id FROM warning_commands WHERE device_id=:d AND created_at>=:idle_start ORDER BY id LIMIT 1");
         $q->execute(['d'=>$deviceId,'idle_start'=>$r['state_changed_at']]);
-        if($q->fetchColumn())return;
+        if($q->fetchColumn()){
+            $p->rollBack();
+            return;
+        }
 
         $msg='You have been idle for '.$minutes.' minute'.($minutes===1?'':'s').'. Please resume calling now.';
         $q=$p->prepare("INSERT INTO warning_commands(employee_id,device_id,command_type,message) VALUES(:e,:d,'AUTO_IDLE_WARNING',:m)");
         $q->execute(['e'=>$employeeId,'d'=>$deviceId,'m'=>$msg]);
+        $p->commit();
     }catch(Throwable $e){
-        // Log the actual failing statement context; do not try to continue a failed transaction.
+        if($started && $p->inTransaction()){try{$p->rollBack();}catch(Throwable $ignored){}}
         error_log('AUTO IDLE WARNING DB ERROR: '.get_class($e).' | '.$e->getMessage());
         throw $e;
-    }finally{
-        if($locked){
-            try{$p->prepare('SELECT pg_advisory_unlock(hashtext(:k))')->execute(['k'=>$lockKey]);}
-            catch(Throwable $unlockError){error_log('AUTO IDLE WARNING UNLOCK ERROR: '.$unlockError->getMessage());}
-        }
     }
 }
-
 function dbFresh(): PDO {
     global $config;
     $pdo=new PDO($config['db']['dsn'],$config['db']['user'],$config['db']['password'],[
